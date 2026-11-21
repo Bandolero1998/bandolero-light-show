@@ -167,6 +167,10 @@ export class ObdBleClient {
     return this.device !== null && this.writer !== null && this.reader !== null;
   }
 
+  get isBusy(): boolean {
+    return this.pending !== null;
+  }
+
   get currentCapabilities(): VehicleCapabilities | null {
     return this.capabilities;
   }
@@ -768,4 +772,17 @@ export class ObdBleClient {
       this.manager?.destroy();
     } catch {}
   }
+}
+
+let _sharedObdClient: ObdBleClient | null = null;
+
+/**
+ * Global singleton OBD BLE client shared across Settings, Home, Garage, and Light Show.
+ * Prevents duplicate disconnected instances when switching tabs.
+ */
+export function getSharedObdClient(): ObdBleClient {
+  if (!_sharedObdClient) {
+    _sharedObdClient = new ObdBleClient();
+  }
+  return _sharedObdClient;
 }

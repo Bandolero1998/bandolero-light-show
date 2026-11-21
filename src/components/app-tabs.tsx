@@ -1,11 +1,10 @@
-
 import { NativeTabs } from 'expo-router/native-tabs';
 
 export default function AppTabs() {
   return (
     <NativeTabs
-      backgroundColor="#080810"
-      tintColor="#C084FC"
+      backgroundColor="#08080A"
+      tintColor="#EF4444"
     >
       <NativeTabs.Trigger name="index">
         <NativeTabs.Trigger.Label>Home</NativeTabs.Trigger.Label>
@@ -20,11 +19,6 @@ export default function AppTabs() {
       <NativeTabs.Trigger name="light-show">
         <NativeTabs.Trigger.Label>Light Show</NativeTabs.Trigger.Label>
         <NativeTabs.Trigger.Icon sf="bolt.fill" md="bolt" />
-      </NativeTabs.Trigger>
-
-      <NativeTabs.Trigger name="ai-assistant">
-        <NativeTabs.Trigger.Label>AI</NativeTabs.Trigger.Label>
-        <NativeTabs.Trigger.Icon sf="sparkles" md="auto_awesome" />
       </NativeTabs.Trigger>
 
       <NativeTabs.Trigger name="settings">

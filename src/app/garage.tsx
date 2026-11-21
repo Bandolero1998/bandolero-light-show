@@ -55,7 +55,7 @@ export default function GarageScreen() {
 
   return (
     <View style={s.page}>
-      <ScrollView contentContainerStyle={s.content}>
+      <ScrollView contentContainerStyle={s.content} showsVerticalScrollIndicator={false}>
         <Text style={s.brand}>BANDOLERO</Text>
         <Text style={s.title}>MOJA GARAŽA</Text>
         <Text style={s.sub}>SAČUVANA VOZILA · {vehicles.length}</Text>
@@ -118,7 +118,7 @@ export default function GarageScreen() {
                 value={val}
                 onChangeText={set}
                 placeholder={ph}
-                placeholderTextColor="#716A7C"
+                placeholderTextColor="#7A6E72"
                 style={s.input}
               />
             ))}
@@ -127,7 +127,7 @@ export default function GarageScreen() {
               <Text style={s.addText}>SAČUVAJ VOZILO</Text>
             </TouchableOpacity>
             <TouchableOpacity onPress={() => setOpen(false)} style={{ padding: 14, alignItems: 'center' }}>
-              <Text style={{ color: '#A99DB5' }}>OTKAŽI</Text>
+              <Text style={{ color: '#FCA5A5', fontWeight: '700' }}>OTKAŽI</Text>
             </TouchableOpacity>
           </View>
         </View>
@@ -137,32 +137,32 @@ export default function GarageScreen() {
 }
 
 const s = StyleSheet.create({
-  page: { flex: 1, backgroundColor: '#080810' },
-  content: { padding: 24, paddingTop: 62, paddingBottom: 36 },
-  brand: { color: '#A855F7', fontSize: 12, fontWeight: '900', letterSpacing: 5 },
-  title: { color: '#fff', fontSize: 30, fontWeight: '900', marginTop: 34 },
-  sub: { color: '#888397', fontSize: 10, letterSpacing: 2, marginTop: 5, marginBottom: 28 },
-  card: { flexDirection: 'row', alignItems: 'center', gap: 13, backgroundColor: '#171323', borderColor: '#30263B', borderWidth: 1, borderRadius: 18, padding: 16, marginBottom: 13 },
-  activeCard: { borderColor: '#A855F7', backgroundColor: '#1F172E' },
+  page: { flex: 1, backgroundColor: '#050507' },
+  content: { padding: 24, paddingTop: 74, paddingBottom: 145 },
+  brand: { color: '#EF4444', fontSize: 12, fontWeight: '900', letterSpacing: 5 },
+  title: { color: '#fff', fontSize: 30, fontWeight: '900', marginTop: 12 },
+  sub: { color: '#8E868A', fontSize: 10, letterSpacing: 2, marginTop: 5, marginBottom: 24 },
+  card: { flexDirection: 'row', alignItems: 'center', gap: 13, backgroundColor: '#110D0F', borderColor: '#2E161A', borderWidth: 1, borderRadius: 18, padding: 16, marginBottom: 13 },
+  activeCard: { borderColor: '#DC2626', backgroundColor: '#1A0D10' },
   car: { fontSize: 38 },
   name: { color: '#fff', fontSize: 17, fontWeight: '800' },
-  meta: { color: '#9991A4', fontSize: 11, marginTop: 4 },
-  state: { color: '#C084FC', fontSize: 9, letterSpacing: 1.2, marginTop: 10, fontWeight: '800' },
-  select: { alignSelf: 'flex-start', marginTop: 10, paddingVertical: 7, paddingHorizontal: 10, borderRadius: 8, backgroundColor: '#30203E' },
-  selectText: { color: '#E9D5FF', fontSize: 9, fontWeight: '900', letterSpacing: 0.7 },
+  meta: { color: '#9E9296', fontSize: 11, marginTop: 4 },
+  state: { color: '#EF4444', fontSize: 9, letterSpacing: 1.2, marginTop: 10, fontWeight: '800' },
+  select: { alignSelf: 'flex-start', marginTop: 10, paddingVertical: 7, paddingHorizontal: 10, borderRadius: 8, backgroundColor: '#2E1318' },
+  selectText: { color: '#FCA5A5', fontSize: 9, fontWeight: '900', letterSpacing: 0.7 },
   remove: { padding: 8 },
-  removeText: { color: '#8D8298', fontSize: 24 },
-  add: { backgroundColor: '#8B35D1', padding: 17, borderRadius: 12, alignItems: 'center', marginTop: 10 },
+  removeText: { color: '#99878B', fontSize: 24 },
+  add: { backgroundColor: '#DC2626', padding: 17, borderRadius: 12, alignItems: 'center', marginTop: 10 },
   addText: { color: '#fff', fontWeight: '900', letterSpacing: 1.5, fontSize: 11 },
-  note: { color: '#746D7D', fontSize: 11, lineHeight: 18, textAlign: 'center', marginTop: 22 },
-  overlay: { flex: 1, backgroundColor: '#000B', justifyContent: 'flex-end' },
-  sheet: { backgroundColor: '#171323', padding: 24, borderTopLeftRadius: 24, borderTopRightRadius: 24 },
+  note: { color: '#786D70', fontSize: 11, lineHeight: 18, textAlign: 'center', marginTop: 22 },
+  overlay: { flex: 1, backgroundColor: '#000C', justifyContent: 'flex-end' },
+  sheet: { backgroundColor: '#120D0F', padding: 24, paddingBottom: 38, borderTopLeftRadius: 24, borderTopRightRadius: 24, borderTopWidth: 1, borderColor: '#3A151B' },
   sheetTitle: { color: '#fff', fontSize: 18, fontWeight: '900', letterSpacing: 2, marginBottom: 12 },
-  presetLabel: { color: '#A855F7', fontSize: 9, fontWeight: '800', letterSpacing: 1, marginBottom: 8 },
+  presetLabel: { color: '#EF4444', fontSize: 9, fontWeight: '800', letterSpacing: 1, marginBottom: 8 },
   presetRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 14 },
-  presetChip: { backgroundColor: '#261B34', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 8, borderWidth: 1, borderColor: '#482D67' },
-  presetText: { color: '#D8B4FE', fontSize: 10, fontWeight: '700' },
-  input: { backgroundColor: '#0E0C14', borderColor: '#382B45', borderWidth: 1, borderRadius: 11, color: '#fff', padding: 14, marginBottom: 10 },
-  empty: { padding: 22, backgroundColor: '#15121F', borderRadius: 16, marginBottom: 16 },
+  presetChip: { backgroundColor: '#261115', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 8, borderWidth: 1, borderColor: '#5C1C24' },
+  presetText: { color: '#FCA5A5', fontSize: 10, fontWeight: '700' },
+  input: { backgroundColor: '#090708', borderColor: '#3A1A20', borderWidth: 1, borderRadius: 11, color: '#fff', padding: 14, marginBottom: 10 },
+  empty: { padding: 22, backgroundColor: '#110D0F', borderRadius: 16, marginBottom: 16, borderWidth: 1, borderColor: '#2E161A' },
   emptyTitle: { color: '#fff', fontWeight: '800', fontSize: 16 },
 });

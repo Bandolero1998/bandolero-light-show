@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -11,8 +11,7 @@ import {
   PermissionsAndroid,
 } from 'react-native';
 import { useAppStore } from '@/store/app-store';
-import { AdapterInfo, LiveData, ObdBleClient } from '@/services/obd-ble';
-import { VehicleCapabilities } from '@/services/vehicle-capabilities';
+import { AdapterInfo, LiveData, getSharedObdClient } from '@/services/obd-ble';
 
 export default function SettingsScreen() {
   const {
@@ -21,16 +20,18 @@ export default function SettingsScreen() {
     setLastObdData,
     capabilities,
     setCapabilities,
+    connectionStatus,
     setConnectionStatus,
     setAdapterName,
   } = useAppStore();
 
-  const client = useRef<ObdBleClient | null>(null);
+  const sharedClient = getSharedObdClient();
+
   const [devices, setDevices] = useState<AdapterInfo[]>([]);
   const [scanning, setScanning] = useState(false);
   const [connecting, setConnecting] = useState(false);
-  const [connected, setConnected] = useState(false);
-  const [status, setStatus] = useState('Nije povezano');
+  const [connected, setConnected] = useState(() => sharedClient.isConnected || connectionStatus === 'connected');
+  const [status, setStatus] = useState(() => (sharedClient.isConnected ? `Povezano: ${adapterName}` : 'Nije povezano'));
   const [protocol, setProtocol] = useState('');
   const [adapterModel, setAdapterModel] = useState('');
   const [live, setLive] = useState<LiveData | null>(null);
@@ -38,16 +39,16 @@ export default function SettingsScreen() {
   const [isLiveStreaming, setIsLiveStreaming] = useState(false);
   const [scanningCaps, setScanningCaps] = useState(false);
 
+  // Sync local connected state with shared singleton & global store
   useEffect(() => {
-    return () => {
-      client.current?.destroy().catch(() => {});
-    };
-  }, []);
-
-  const getClient = () => {
-    if (!client.current) client.current = new ObdBleClient();
-    return client.current;
-  };
+    const active = sharedClient.isConnected;
+    setConnected(active);
+    if (active) {
+      setStatus(`Povezano: ${adapterName}`);
+    } else if (connectionStatus === 'disconnected') {
+      setIsLiveStreaming(false);
+    }
+  }, [connectionStatus, adapterName]);
 
   const requestBluetoothPermissions = async () => {
     if (Platform.OS !== 'android') return true;
@@ -63,10 +64,10 @@ export default function SettingsScreen() {
           result[PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT] === PermissionsAndroid.RESULTS.GRANTED
         );
       } else {
-        const status = await PermissionsAndroid.request(
+        const perm = await PermissionsAndroid.request(
           PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
         );
-        return status === PermissionsAndroid.RESULTS.GRANTED;
+        return perm === PermissionsAndroid.RESULTS.GRANTED;
       }
     } catch {
       return false;
@@ -92,7 +93,7 @@ export default function SettingsScreen() {
     setScanning(true);
     setStatus('Tražim samo VLinker BM+ / OBD BLE adaptere...');
     try {
-      await getClient().scan(
+      await sharedClient.scan(
         d => {
           setDevices(old => {
             if (old.some(x => x.id === d.id)) return old;
@@ -121,7 +122,7 @@ export default function SettingsScreen() {
     setConnectionStatus('connecting');
     setStatus(`Povezujem ${d.name}...`);
     try {
-      const info = await getClient().connect(d.id, () => {
+      const info = await sharedClient.connect(d.id, () => {
         setConnected(false);
         setConnectionStatus('disconnected');
         setLive(null);
@@ -150,7 +151,7 @@ export default function SettingsScreen() {
 
   const disconnect = async () => {
     stopLiveStream();
-    await client.current?.disconnect();
+    await sharedClient.disconnect();
     setConnected(false);
     setConnectionStatus('disconnected');
     setLive(null);
@@ -158,10 +159,10 @@ export default function SettingsScreen() {
   };
 
   const scanVehicleCapabilities = async () => {
-    if (!client.current || !client.current.isConnected) return;
+    if (!sharedClient.isConnected) return;
     setScanningCaps(true);
     try {
-      const caps = await client.current.scanCapabilities();
+      const caps = await sharedClient.scanCapabilities();
       setCapabilities(caps);
     } catch (e: any) {
       console.warn('Scan capabilities notice:', e?.message);
@@ -171,10 +172,13 @@ export default function SettingsScreen() {
   };
 
   const refresh = async () => {
-    if (!client.current || !connected) return;
+    if (!sharedClient.isConnected) {
+      Alert.alert('OBD nije povezan', 'Poveži VLinker BM+ adapter pre očitavanja podataka.');
+      return;
+    }
     setReading(true);
     try {
-      const snapshot = await client.current.readLiveData();
+      const snapshot = await sharedClient.readLiveData();
       setLive(snapshot);
       setLastObdData(snapshot);
     } catch (e: any) {
@@ -193,9 +197,9 @@ export default function SettingsScreen() {
   };
 
   const startLiveStream = () => {
-    if (!client.current || !connected) return;
+    if (!sharedClient.isConnected) return;
     setIsLiveStreaming(true);
-    client.current.startPolling(data => {
+    sharedClient.startPolling(data => {
       setLive(data);
       setLastObdData(data);
     }, 700);
@@ -203,7 +207,7 @@ export default function SettingsScreen() {
 
   const stopLiveStream = () => {
     setIsLiveStreaming(false);
-    client.current?.stopPolling();
+    sharedClient.stopPolling();
   };
 
   const confirmClearDtcs = () => {
@@ -217,7 +221,7 @@ export default function SettingsScreen() {
           style: 'destructive',
           onPress: async () => {
             try {
-              const ok = await getClient().clearDtcCodes();
+              const ok = await sharedClient.clearDtcCodes();
               if (ok) {
                 Alert.alert('Uspešno', 'Komanda za brisanje grešaka je poslata motornom računaru.');
                 refresh();
@@ -235,7 +239,7 @@ export default function SettingsScreen() {
 
   return (
     <View style={s.page}>
-      <ScrollView contentContainerStyle={s.content}>
+      <ScrollView contentContainerStyle={s.content} showsVerticalScrollIndicator={false}>
         <Text style={s.brand}>BANDOLERO</Text>
         <Text style={s.title}>DIAGNOSTICS</Text>
         <Text style={s.sub}>LIVE OBD-II & ELM327/STN TRANSPORTER</Text>
@@ -261,7 +265,7 @@ export default function SettingsScreen() {
 
         {connecting && (
           <View style={s.inline}>
-            <ActivityIndicator color="#B56AF0" />
+            <ActivityIndicator color="#EF4444" />
             <Text style={s.hint}>Inicijalizacija ELM327/STN protokola i provera ECU odziva...</Text>
           </View>
         )}
@@ -360,7 +364,7 @@ export default function SettingsScreen() {
                 {reading ? <ActivityIndicator color="#fff" /> : <Text style={s.primaryText}>OČITAJ SADA</Text>}
               </TouchableOpacity>
               <TouchableOpacity
-                style={[s.secondary, { flex: 1, backgroundColor: isLiveStreaming ? '#059669' : '#292132' }]}
+                style={[s.secondary, { flex: 1, backgroundColor: isLiveStreaming ? '#059669' : '#261114' }]}
                 onPress={toggleLiveStream}
               >
                 <Text style={[s.secondaryText, isLiveStreaming && { color: '#fff' }]}>
@@ -433,7 +437,7 @@ export default function SettingsScreen() {
           <Text style={s.value}>1.2.0</Text>
         </View>
         <Text style={s.note}>
-          Ova aplikacija koristi direktan BLE transport via react-native-ble-plx. Za Audi A8 D4 4.2 TDI testirano je generisanje komandi za Module 09 (Central Electrics BCM) preko CAN busa.
+          Ova aplikacija koristi deljenu BLE OBD sesiju preko react-native-ble-plx za Vgate vLinker BM+. Za Audi A8 D4 4.2 TDI koristi se UDS Module 09 (0x710) sa TesterPresent (3E 80) održavanjem sesije.
         </Text>
       </ScrollView>
     </View>
@@ -453,38 +457,38 @@ function metric(label: string, value: number | undefined, unit: string) {
 }
 
 const s = StyleSheet.create({
-  page: { flex: 1, backgroundColor: '#080810' },
-  content: { padding: 24, paddingTop: 76, paddingBottom: 110 },
-  brand: { color: '#A855F7', fontSize: 12, fontWeight: '900', letterSpacing: 5 },
+  page: { flex: 1, backgroundColor: '#050507' },
+  content: { padding: 24, paddingTop: 74, paddingBottom: 145 },
+  brand: { color: '#EF4444', fontSize: 12, fontWeight: '900', letterSpacing: 5 },
   title: { color: '#fff', fontSize: 30, fontWeight: '900', marginTop: 12 },
-  sub: { color: '#888397', fontSize: 10, letterSpacing: 3, marginTop: 5, marginBottom: 28 },
-  section: { color: '#A855F7', fontSize: 10, fontWeight: '900', letterSpacing: 2, marginTop: 23, marginBottom: 10 },
-  card: { backgroundColor: '#15121F', borderColor: '#30263B', borderWidth: 1, borderRadius: 13, padding: 16, marginBottom: 9, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  sub: { color: '#8E868A', fontSize: 10, letterSpacing: 3, marginTop: 5, marginBottom: 24 },
+  section: { color: '#EF4444', fontSize: 10, fontWeight: '900', letterSpacing: 2, marginTop: 22, marginBottom: 10 },
+  card: { backgroundColor: '#110D0F', borderColor: '#2E161A', borderWidth: 1, borderRadius: 13, padding: 16, marginBottom: 9, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   item: { color: '#fff', fontSize: 12, fontWeight: '700' },
-  hint: { color: '#777184', fontSize: 9, marginTop: 5 },
-  value: { color: '#BFA0D9', fontSize: 10 },
+  hint: { color: '#8A7E82', fontSize: 9, marginTop: 5, lineHeight: 14 },
+  value: { color: '#FCA5A5', fontSize: 10, fontWeight: '700' },
   dot: { width: 9, height: 9, borderRadius: 5, marginLeft: 12 },
-  primary: { backgroundColor: '#8737C7', padding: 16, borderRadius: 12, alignItems: 'center', marginTop: 5 },
+  primary: { backgroundColor: '#DC2626', padding: 16, borderRadius: 12, alignItems: 'center', marginTop: 5 },
   primaryText: { color: '#fff', fontSize: 10, fontWeight: '900', letterSpacing: 1.1 },
-  secondary: { backgroundColor: '#292132', padding: 15, borderRadius: 12, alignItems: 'center', marginTop: 5 },
-  secondaryText: { color: '#D7B8EF', fontSize: 10, fontWeight: '900', letterSpacing: 1 },
-  device: { backgroundColor: '#1D1726', borderColor: '#6D3A91', borderWidth: 1, borderRadius: 12, padding: 14, marginTop: 9, flexDirection: 'row', alignItems: 'center' },
-  knownBadge: { backgroundColor: '#8B35D1', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
+  secondary: { backgroundColor: '#261114', borderWidth: 1, borderColor: '#4A1820', padding: 15, borderRadius: 12, alignItems: 'center', marginTop: 5 },
+  secondaryText: { color: '#FCA5A5', fontSize: 10, fontWeight: '900', letterSpacing: 1 },
+  device: { backgroundColor: '#160E10', borderColor: '#7F1D1D', borderWidth: 1, borderRadius: 12, padding: 14, marginTop: 9, flexDirection: 'row', alignItems: 'center' },
+  knownBadge: { backgroundColor: '#DC2626', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 },
   knownBadgeText: { color: '#fff', fontSize: 8, fontWeight: '900' },
   inline: { flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 12 },
   metrics: { flexDirection: 'row', flexWrap: 'wrap', gap: 9, marginVertical: 10 },
-  metric: { width: '48%', backgroundColor: '#15121F', borderWidth: 1, borderColor: '#30263B', borderRadius: 12, padding: 14 },
-  metricLabel: { color: '#81778E', fontSize: 9 },
+  metric: { width: '48%', backgroundColor: '#110D0F', borderWidth: 1, borderColor: '#2E161A', borderRadius: 12, padding: 14 },
+  metricLabel: { color: '#94868A', fontSize: 9 },
   metricValue: { color: '#fff', fontSize: 22, fontWeight: '800', marginTop: 7 },
-  unit: { color: '#A855F7', fontSize: 10 },
-  miniButton: { backgroundColor: '#8B35D1', paddingVertical: 6, paddingHorizontal: 12, borderRadius: 8 },
+  unit: { color: '#EF4444', fontSize: 10 },
+  miniButton: { backgroundColor: '#DC2626', paddingVertical: 6, paddingHorizontal: 12, borderRadius: 8 },
   miniButtonText: { color: '#fff', fontSize: 9, fontWeight: '800' },
   chipContainer: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginVertical: 8 },
-  capChip: { backgroundColor: '#1C1528', borderColor: '#4C2C6E', borderWidth: 1, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6 },
-  capChipText: { color: '#D8B4FE', fontSize: 9, fontWeight: '700' },
-  code: { backgroundColor: '#261A30', borderRadius: 8, padding: 11, marginBottom: 7, borderColor: '#7E22CE', borderWidth: 1 },
-  codeText: { color: '#E7C9FF', fontWeight: '800', fontSize: 12 },
+  capChip: { backgroundColor: '#1A0D10', borderColor: '#5C1C24', borderWidth: 1, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6 },
+  capChipText: { color: '#FCA5A5', fontSize: 9, fontWeight: '700' },
+  code: { backgroundColor: '#240E12', borderRadius: 8, padding: 11, marginBottom: 7, borderColor: '#B91C1C', borderWidth: 1 },
+  codeText: { color: '#FECACA', fontWeight: '800', fontSize: 12 },
   dangerButton: { backgroundColor: '#7F1D1D', padding: 14, borderRadius: 10, alignItems: 'center', marginTop: 8 },
   dangerButtonText: { color: '#FCA5A5', fontSize: 10, fontWeight: '900', letterSpacing: 1 },
-  note: { color: '#82798C', fontSize: 10, lineHeight: 17, marginTop: 4 },
+  note: { color: '#786D70', fontSize: 10, lineHeight: 17, marginTop: 4 },
 });
