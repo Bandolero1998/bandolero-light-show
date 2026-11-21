@@ -22,6 +22,15 @@ test('Elm327Protocol.parsePidValue decodes Mode 01 PID 0D (Vehicle Speed)', () =
 
   const raw75 = '41 0D 4B>';
   assert.strictEqual(Elm327Protocol.parsePidValue('0D', raw75), 75);
+
+  // Real Audi A8 D4 response with ATS0 (spaces off) and dual ECU replies
+  const rawAudi = '410D00 410D00>';
+  assert.strictEqual(Elm327Protocol.parsePidValue('0D', rawAudi), 0);
+  assert.strictEqual(Elm327Protocol.parsePidValue('010D', rawAudi), 0);
+
+  const rawAudiRpm = '410C0000 410C0000>';
+  assert.strictEqual(Elm327Protocol.parsePidValue('0C', rawAudiRpm), 0);
+  assert.strictEqual(Elm327Protocol.parsePidValue('010C', rawAudiRpm), 0);
 });
 
 test('Elm327Protocol.parsePidValue decodes Mode 01 PID 05 (Coolant Temperature)', () => {

@@ -190,7 +190,7 @@ export default function LightShowScreen() {
 
     Alert.alert(
       'Pokretanje testa na vozilu (Audi A8 D4 Module 09)',
-      `Redosled izvršavanja:\n1. ATSH 7DF + ATCRA + provera 010D (0 km/h)\n2. Prebacivanje na Modul 09 (ATSH 710)\n3. UDS Extended Session (10 03) + TesterPresent (3E 80)\n4. Efekat: ${selectedEffect.toUpperCase()}\n\nDa li je kontakt uključen i vozilo u mirovanju?`,
+      `Redosled izvršavanja:\n1. ATSH 7DF + ATCRA + provera 010D (0 km/h)\n2. Prebacivanje na Modul 09 (ATSH 70E/778 ili 710/77A)\n3. UDS Extended Session (10 03) + TesterPresent (3E 80)\n4. Efekat: ${selectedEffect.toUpperCase()}\n\nDa li je kontakt uključen i vozilo u mirovanju?`,
       [
         { text: 'Otkaži', style: 'cancel' },
         {
@@ -437,7 +437,12 @@ export default function LightShowScreen() {
 
             {/* Live Command Console Output */}
             <Text style={s.consoleTitle}>KOMANDNI ODZIV VOZILA (TX / RX LOG):</Text>
-            <View style={s.consoleBox}>
+            <ScrollView
+              style={s.consoleBox}
+              contentContainerStyle={s.consoleContent}
+              nestedScrollEnabled
+              showsVerticalScrollIndicator
+            >
               {commandLogs.length === 0 ? (
                 <Text style={s.consoleEmpty}>Nema zabeleženih komandi. Pokreni test da vidiš UDS razmenu sa vozilom.</Text>
               ) : (
@@ -461,7 +466,7 @@ export default function LightShowScreen() {
                   </View>
                 ))
               )}
-            </View>
+            </ScrollView>
           </View>
         )}
 
@@ -560,7 +565,8 @@ const s = StyleSheet.create({
   panicButton: { backgroundColor: '#991B1B', borderWidth: 1, borderColor: '#EF4444', paddingHorizontal: 14, paddingVertical: 16, borderRadius: 12, justifyContent: 'center', alignItems: 'center' },
   panicButtonText: { color: '#fff', fontSize: 10, fontWeight: '900' },
   consoleTitle: { color: '#EF4444', fontSize: 9, fontWeight: '900', letterSpacing: 1, marginTop: 16, marginBottom: 8 },
-  consoleBox: { backgroundColor: '#050507', borderRadius: 10, borderWidth: 1, borderColor: '#2E161A', padding: 10, maxHeight: 180 },
+  consoleBox: { backgroundColor: '#050507', borderRadius: 10, borderWidth: 1, borderColor: '#2E161A', maxHeight: 180, overflow: 'hidden' },
+  consoleContent: { padding: 10 },
   consoleEmpty: { color: '#6E6266', fontSize: 9, fontStyle: 'italic', textAlign: 'center', paddingVertical: 12 },
   logRow: { flexDirection: 'row', gap: 6, marginBottom: 4 },
   logDirection: { fontSize: 9, fontWeight: '900', fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace' },

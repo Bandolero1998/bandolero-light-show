@@ -169,15 +169,20 @@ export class Elm327Protocol {
 
   /**
    * Parses Mode 01 PID calculations.
+   * Accepts either 2-char PID ("0D", "0C") or full Mode 01 request ("010D", "010C").
    */
   static parsePidValue(pid: string, rawResponse: string): number | boolean | null {
+    const normalizedPid = pid
+      .replace(/\s+/g, '')
+      .toUpperCase()
+      .replace(/^01([0-9A-F]{2})$/, '$1');
     const clean = this.cleanResponse(rawResponse);
-    const data = this.extractPositiveResponse(clean, '01', pid);
+    const data = this.extractPositiveResponse(clean, '01', normalizedPid);
     if (!data) return null;
 
     const b = (start: number, len = 2) => parseInt(data.slice(start, start + len), 16);
 
-    switch (pid.toUpperCase()) {
+    switch (normalizedPid) {
       case '0C': // RPM: ((A*256)+B)/4
         if (data.length >= 4) return (b(0) * 256 + b(2)) / 4;
         break;

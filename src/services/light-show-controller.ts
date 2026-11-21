@@ -151,8 +151,19 @@ export class LightShowController {
   private client: ObdBleClient | null = null;
   private isRunning = false;
   private abortRequested = false;
+  private udsSessionActive = false;
   private testerPresentTimer: ReturnType<typeof setInterval> | null = null;
   private logCallback?: (entry: CommandLogEntry) => void;
+
+  /**
+   * Audi A8 D4 (4H) / VAG UDS physical CAN Tx/Rx pairs for Module 09 (BCM1 / Central Electrics).
+   * Primary: 0x70E -> 0x778 (standard VAG UDS Module 09 BCM1)
+   * Fallback: 0x710 -> 0x77A (alternate VAG gateway/BCM addressing)
+   */
+  private static readonly MODULE09_TARGETS = [
+    { tx: '70E', rx: '778', label: 'Modul 09 BCM1 (0x70E / 0x778)' },
+    { tx: '710', rx: '77A', label: 'Modul 09 alt (0x710 / 0x77A)' },
+  ];
 
   constructor(client: ObdBleClient | null, onLog?: (entry: CommandLogEntry) => void) {
     this.client = client;
@@ -165,6 +176,18 @@ export class LightShowController {
 
   private log(direction: CommandLogEntry['direction'], text: string) {
     this.logCallback?.({ timestamp: Date.now(), direction, text });
+  }
+
+  /**
+   * Waits briefly for any in-flight BLE command (e.g. background polling) to finish
+   * so our UDS/AT commands do not collide with "OBD komunikacija je zauzeta".
+   */
+  private async waitUntilIdle(maxWaitMs = 2000): Promise<void> {
+    let waited = 0;
+    while (this.client?.isBusy && waited < maxWaitMs) {
+      await new Promise(r => setTimeout(r, 50));
+      waited += 50;
+    }
   }
 
   /**
@@ -253,8 +276,12 @@ export class LightShowController {
 
     if (this.client && this.client.isConnected) {
       try {
-        await this.exec('2F000000', 1500).catch(() => {});
-        await this.exec('10 01', 1500).catch(() => {});
+        await this.waitUntilIdle(1500);
+        if (this.udsSessionActive) {
+          await this.exec('2F000000', 1500).catch(() => {});
+          await this.exec('10 01', 1500).catch(() => {});
+          this.udsSessionActive = false;
+        }
         await this.exec('ATSH 7DF', 1500).catch(() => {});
         await this.exec('ATCRA', 1500).catch(() => {});
         this.log('INFO', 'Kontrola svetala vraćena računaru vozila (10 01 / ATSH 7DF).');
@@ -262,13 +289,14 @@ export class LightShowController {
         this.log('ERROR', `Greška pri bezbednosnom resetovanju: ${err?.message}`);
       }
     } else {
+      this.udsSessionActive = false;
       this.log('ERROR', 'OBD adapter nije povezan — lokalno zaustavljeno.');
     }
   }
 
   /**
    * Executes a physical actuator light test sequence on the vehicle.
-   * Targets Audi A8 D4 Module 09 (Central Electrics BCM at CAN ID 0x710).
+   * Targets Audi A8 D4 Module 09 (Central Electrics BCM1: 0x70E/0x778, fallback 0x710/0x77A).
    */
   async runVehicleSequence(
     effectId: LightEffectId,
@@ -282,11 +310,13 @@ export class LightShowController {
       throw new Error('OBD adapter nije povezan. Prvo poveži VLinker BM+ u Settings tabu.');
     }
 
-    // Pause live dashboard polling so it does not collide with UDS frames
+    // Pause live dashboard polling and wait for any in-flight BLE frame to finish
     this.client.stopPolling();
+    await this.waitUntilIdle(2000);
 
     this.isRunning = true;
     this.abortRequested = false;
+    this.udsSessionActive = false;
 
     this.log('INFO', `Započinjem sekvencu "${effectId.toUpperCase()}" na vozilu Audi A8 D4.`);
     this.log('INFO', 'Korak 1: Resetovanje CAN headera (7DF) i provera brzine (010D).');
@@ -297,17 +327,17 @@ export class LightShowController {
       await this.exec('ATSH 7DF', 2000);
       await this.exec('ATCRA', 2000);
 
-      // Query vehicle speed (PID 010D)
+      // Query vehicle speed (PID 010D -> Mode 01, PID 0D)
       onProgress?.('Provera brzine vozila (PID 010D)...', 18);
       const speedRaw = await this.exec('010D', 3000);
-      const parsedSpeed = Elm327Protocol.parsePidValue('010D', speedRaw);
+      const parsedSpeed = Elm327Protocol.parsePidValue('0D', speedRaw);
       const speed = typeof parsedSpeed === 'number' ? parsedSpeed : undefined;
 
-      // Query RPM (PID 010C) if available
+      // Query RPM (PID 010C -> Mode 01, PID 0C) if available
       let rpm: number | undefined;
       try {
         const rpmRaw = await this.exec('010C', 2500);
-        const parsedRpm = Elm327Protocol.parsePidValue('010C', rpmRaw);
+        const parsedRpm = Elm327Protocol.parsePidValue('0C', rpmRaw);
         rpm = typeof parsedRpm === 'number' ? parsedRpm : undefined;
       } catch {}
 
@@ -323,18 +353,45 @@ export class LightShowController {
       }
       this.log('INFO', `Bezbednost potvrđena: brzina ${speed} km/h${rpm !== undefined ? `, obrtaji ${Math.round(rpm)} RPM` : ''}.`);
 
-      // Step 2: ONLY AFTER confirming speed === 0 km/h, switch CAN header to Module 09 (BCM1: 0x710)
-      onProgress?.('Prebacivanje CAN headera na Modul 09 (ATSH 710)...', 30);
-      await this.exec('ATSH 710', 2000);
+      // Step 2 & 3: ONLY AFTER confirming speed === 0 km/h, switch CAN header + RX filter to Module 09
+      // and open UDS Extended Diagnostic Session (10 03).
+      let activeTarget = LightShowController.MODULE09_TARGETS[0];
+      let sessionOpened = false;
 
-      // Step 3: Enter UDS Extended Diagnostic Session (10 03) & start TesterPresent (3E 80) loop
-      onProgress?.('Otvaranje UDS Extended Session (10 03)...', 42);
-      const sessionResp = await this.exec('10 03', 3000);
-      if (/7F\s*10/i.test(sessionResp)) {
-        this.log('INFO', 'Modul 09 je vratio 7F 10 (Extended Session odbijen — proveriti kontakt / sigurnosni pristup).');
-      } else {
-        this.log('INFO', 'UDS Extended Session aktivna — pokrećem TesterPresent (3E 80) na 2s.');
+      for (const target of LightShowController.MODULE09_TARGETS) {
+        if (this.abortRequested) break;
+        onProgress?.(`Povezivanje na ${target.label}...`, 32);
+        await this.exec(`ATSH ${target.tx}`, 2000);
+        await this.exec(`ATCRA ${target.rx}`, 2000);
+
+        onProgress?.(`Otvaranje UDS Extended Session (10 03) na 0x${target.tx}...`, 42);
+        const sessionResp = await this.exec('10 03', 3000);
+        const cleanSession = Elm327Protocol.cleanResponse(sessionResp);
+
+        if (cleanSession.includes('5003')) {
+          activeTarget = target;
+          sessionOpened = true;
+          this.udsSessionActive = true;
+          this.log('INFO', `UDS Extended Session aktivna na ${target.label} — pokrećem TesterPresent (3E 80) na 2s.`);
+          break;
+        }
+
+        if (cleanSession.includes('7F10')) {
+          activeTarget = target;
+          this.udsSessionActive = true;
+          this.log('INFO', `${target.label} je odgovorio sa 7F 10 (Extended Session odbijen — nastavljam test / proveriti kontakt).`);
+          break;
+        }
+
+        this.log('INFO', `${target.label} nije odgovorio na 10 03 (NO DATA) — probam sledeću CAN adresu...`);
       }
+
+      if (!sessionOpened && !this.udsSessionActive) {
+        // Keep last target active so user still sees actuator TX/RX diagnostics on vehicle
+        this.udsSessionActive = true;
+        this.log('INFO', `Nije dobijen 50 03 odgovor ni na 0x70E ni na 0x710 — šaljem komande na ${activeTarget.label}.`);
+      }
+
       this.startTesterPresentLoop();
 
       // Step 4: Execute effect specific actuator pulses
@@ -422,6 +479,7 @@ export class LightShowController {
       this.stopTesterPresentLoop();
       await this.exec('2F000000', 2000).catch(() => {});
       await this.exec('10 01', 2000).catch(() => {});
+      this.udsSessionActive = false;
       await this.exec('ATSH 7DF', 2000).catch(() => {});
       await this.exec('ATCRA', 2000).catch(() => {});
 
@@ -435,6 +493,7 @@ export class LightShowController {
       throw error;
     } finally {
       this.stopTesterPresentLoop();
+      this.udsSessionActive = false;
       this.isRunning = false;
     }
   }
