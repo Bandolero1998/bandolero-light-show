@@ -8,11 +8,21 @@ permissions:
 
 jobs:
   build-ios:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Verify Xcode and Swift toolchain
+        run: |
+          ls -d /Applications/Xcode*.app || true
+          XCODE_26=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -n "$XCODE_26" ]; then
+            sudo xcode-select -s "$XCODE_26/Contents/Developer"
+          fi
+          xcodebuild -version
+          swift --version
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -61,11 +71,14 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
-            build 2>&1 | grep -E "(error:|warning: .*(Error|error)|BUILD FAILED|FAILED|fatal error|linker command failed|clang:|swift:)" | tail -60
-          XCODE_EXIT=${PIPESTATUS[0]}
+            build > xcodebuild.log 2>&1
+          XCODE_EXIT=$?
           set -e
           if [ $XCODE_EXIT -ne 0 ]; then
             echo "--- xcodebuild failed with exit $XCODE_EXIT ---"
+            grep -n -C 3 -E "(error:|BUILD FAILED|fatal error|linker command failed)" xcodebuild.log | tail -100 || true
+            echo "--- last 40 lines of xcodebuild.log ---"
+            tail -40 xcodebuild.log
             exit $XCODE_EXIT
           fi
           APP_PATH=$(find "$PWD/build/ios/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' -print -quit)
