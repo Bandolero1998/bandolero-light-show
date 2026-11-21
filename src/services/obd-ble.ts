@@ -16,7 +16,43 @@ export type AdapterInfo = {
   name: string;
   rssi?: number | null;
   isKnownObd?: boolean;
+  alreadyConnected?: boolean;
 };
+
+/**
+ * Known BLE GATT Service UUIDs used by Vgate vLinker BM+ (BT 4.0 BLE)
+ * and compatible ELM327 / STN OBD-II adapters.
+ */
+export const KNOWN_OBD_SERVICE_UUIDS = [
+  '000018f0-0000-1000-8000-00805f9b34fb', // Vgate vLinker BM+ / iCar Pro BLE primary UART
+  'e7810a71-73ae-499d-8c15-faa9aef0c3f2', // Vgate vLinker BM+ / MC+ / FD+ BLE UART
+  '0000fff0-0000-1000-8000-00805f9b34fb', // Vgate / ELM327 generic BLE UART
+  '0000ffe0-0000-1000-8000-00805f9b34fb', // HM-10 / CC2540 BLE UART
+  '6e400001-b5a3-f393-e0a9-e50e24dcca9e', // Nordic UART Service (NUS)
+];
+
+const KNOWN_OBD_SERVICE_PREFIXES = ['18f0', 'e7810a71', 'fff0', 'ffe0', '6e400001'];
+
+const OBD_NAME_PATTERN =
+  /vlinker|vgate|obd|elm|stn|bm.?ios|bm.?android|bm\+|icar|viecar|konnwei|veepeak|carista|bimmer|v-?link|ios-?vlink/i;
+
+export function isObdAdapterDevice(
+  name?: string | null,
+  localName?: string | null,
+  serviceUUIDs?: string[] | null
+): boolean {
+  const rawName = (name || localName || '').trim();
+  if (rawName && OBD_NAME_PATTERN.test(rawName)) {
+    return true;
+  }
+  if (serviceUUIDs && serviceUUIDs.length > 0) {
+    return serviceUUIDs.some(uuid => {
+      const lower = uuid.toLowerCase();
+      return KNOWN_OBD_SERVICE_PREFIXES.some(prefix => lower.includes(prefix));
+    });
+  }
+  return false;
+}
 
 export type LiveData = ParsedLiveData;
 
@@ -25,6 +61,7 @@ type BleDevice = {
   name?: string | null;
   localName?: string | null;
   rssi?: number | null;
+  serviceUUIDs?: string[] | null;
   connect: (options?: any) => Promise<any>;
   discoverAllServicesAndCharacteristics: () => Promise<any>;
   services: () => Promise<any[]>;
@@ -135,15 +172,59 @@ export class ObdBleClient {
   }
 
   /**
-   * Scans for nearby BLE OBD adapters (VLinker BM+, Vgate, ELM327, etc.)
+   * Scans for nearby BLE OBD adapters (Vgate vLinker BM+, ELM327, STN, etc.).
+   * Also checks adapters already connected to the phone via iOS/Android BLE.
    */
-  async scan(onFound: (adapter: AdapterInfo) => void, seconds = 12): Promise<void> {
+  async scan(
+    onFound: (adapter: AdapterInfo) => void,
+    seconds = 12,
+    options: { onlyObdAdapters?: boolean } = {}
+  ): Promise<void> {
+    const onlyObdAdapters = options.onlyObdAdapters ?? true;
+
     if (!this.manager) {
       const { BleManager } = bleModule();
       this.manager = new BleManager();
     }
     await this.stopScan();
 
+    // Verify Bluetooth radio state before scanning
+    try {
+      const bleState = await this.manager.state();
+      if (bleState === 'PoweredOff') {
+        throw new Error('Bluetooth je isključen na telefonu. Uključi Bluetooth u podešavanjima i pokušaj ponovo.');
+      }
+      if (bleState === 'Unauthorized') {
+        throw new Error('Aplikacija nema dozvolu za Bluetooth. Otvori Postavke → BANDOLERO LIGHT SHOW i uključi Bluetooth.');
+      }
+    } catch (stateErr: any) {
+      if (stateErr?.message?.includes('Bluetooth')) {
+        throw stateErr;
+      }
+    }
+
+    const emittedIds = new Set<string>();
+
+    // 1. First retrieve OBD BLE adapters that are ALREADY connected to the phone (crucial on iOS!)
+    try {
+      const alreadyConnectedDevices: BleDevice[] = await this.manager.connectedDevices(KNOWN_OBD_SERVICE_UUIDS);
+      for (const dev of alreadyConnectedDevices || []) {
+        if (!dev?.id || emittedIds.has(dev.id)) continue;
+        const rawName = (dev.name || dev.localName || '').trim();
+        emittedIds.add(dev.id);
+        onFound({
+          id: dev.id,
+          name: rawName || 'vLinker BM+ / OBD (Povezan)',
+          rssi: dev.rssi,
+          isKnownObd: true,
+          alreadyConnected: true,
+        });
+      }
+    } catch {
+      // Some OS versions may not return connected peripherals; continue with active scan
+    }
+
+    // 2. Actively scan for advertising BLE OBD adapters
     return new Promise((resolve, reject) => {
       let isDone = false;
       const timer = setTimeout(() => {
@@ -163,18 +244,26 @@ export class ObdBleClient {
             reject(error);
             return;
           }
-          if (device) {
-            const rawName = device.name || device.localName || '';
-            const isKnown = /vlinker|vgate|obd|elm|stn|bm.?ios|bm\+|icar|viecar|konnwei/i.test(rawName);
-            const displayName = rawName || (device.id ? `OBD Device (${device.id.slice(0, 5)})` : 'Nepoznat uređaj');
+          if (!device?.id || emittedIds.has(device.id)) return;
 
-            onFound({
-              id: device.id,
-              name: displayName,
-              rssi: device.rssi,
-              isKnownObd: isKnown,
-            });
+          const rawName = (device.name || device.localName || '').trim();
+          const isObd = isObdAdapterDevice(device.name, device.localName, device.serviceUUIDs);
+
+          // Filter out random nearby TVs, air conditioners, watches, and unnamed peripherals
+          if (onlyObdAdapters && !isObd) {
+            return;
           }
+
+          emittedIds.add(device.id);
+          const displayName = rawName || `BLE Adapter (${device.id.slice(0, 6)})`;
+
+          onFound({
+            id: device.id,
+            name: displayName,
+            rssi: device.rssi,
+            isKnownObd: isObd,
+            alreadyConnected: false,
+          });
         });
       } catch (err) {
         clearTimeout(timer);
@@ -197,6 +286,7 @@ export class ObdBleClient {
     deviceId: string,
     onDisconnect?: () => void
   ): Promise<{ name: string; protocol: string; adapterModel: string; voltage?: number }> {
+    await this.stopScan();
     await this.disconnect();
 
     if (!this.manager) {
@@ -212,32 +302,42 @@ export class ObdBleClient {
     this.device = (await connectedDevice.discoverAllServicesAndCharacteristics()) as BleDevice;
     const services = await this.device.services();
 
-    // Prioritized list of known OBD UART service UUIDs:
-    // 1. FFF0: Vgate / VLinker BM+ UART
-    // 2. 6E400001: Nordic UART Service (NUS)
-    // 3. FFE0: TI CC2540 BLE-UART
-    // 4. Any service containing both writable and notifiable characteristics
-    let selectedPair: { writer: Characteristic; reader: Characteristic } | null = null;
+    // Prioritized list of known OBD UART service UUIDs (Vgate vLinker BM+ first):
+    // 1. 18F0: Vgate vLinker BM+ / iCar Pro BLE primary UART (write 2AF1, notify 2AF0)
+    // 2. E7810A71: Vgate vLinker BM+ / MC+ / FD+ BLE UART (BEF8D6C9)
+    // 3. FFF0: Vgate / ELM327 generic BLE UART
+    // 4. 6E400001: Nordic UART Service (NUS)
+    // 5. FFE0: TI CC2540 / HM-10 BLE-UART
+    // 6. Fallback: any service containing both writable and notifiable characteristics
+    const priorityOrder = ['18f0', 'e7810a71', 'fff0', '6e400001', 'ffe0'];
+    let selectedPair: { writer: Characteristic; reader: Characteristic; priority: number } | null = null;
 
     for (const service of services) {
       const chars = (await this.device.characteristicsForService(service.uuid)) as Characteristic[];
-      const writer = chars.find(c => c.isWritableWithResponse) || chars.find(c => c.isWritableWithoutResponse);
-      const reader = chars.find(c => c.isNotifiable || c.isIndicatable);
+      const writer =
+        chars.find(c => c.uuid.toLowerCase().includes('2af1')) ||
+        chars.find(c => c.isWritableWithResponse) ||
+        chars.find(c => c.isWritableWithoutResponse);
+      const reader =
+        chars.find(c => c.uuid.toLowerCase().includes('2af0')) ||
+        chars.find(c => c.isNotifiable || c.isIndicatable);
 
       if (writer && reader) {
-        selectedPair = { writer, reader };
-        // If it's a known OBD service, stop searching immediately
         const sUuid = service.uuid.toLowerCase();
-        if (sUuid.includes('fff0') || sUuid.includes('6e400001') || sUuid.includes('ffe0')) {
-          break;
+        const idx = priorityOrder.findIndex(prefix => sUuid.includes(prefix));
+        const priority = idx >= 0 ? idx : 99;
+
+        if (!selectedPair || priority < selectedPair.priority) {
+          selectedPair = { writer, reader, priority };
         }
+        if (priority === 0) break;
       }
     }
 
     if (!selectedPair) {
       await this.disconnect();
       throw new Error(
-        'Povezan je Bluetooth uređaj, ali nije pronađen OBD UART komunikacioni kanal (write + notify). Proveri da li je izabran ispravan VLinker adapter.'
+        'Povezan je Bluetooth uređaj, ali nije pronađen OBD UART komunikacioni kanal (write + notify). Proveri da li je izabran vLinker BM-IOS adapter.'
       );
     }
 
@@ -287,17 +387,26 @@ export class ObdBleClient {
       this.disconnectHandler?.();
     });
 
+    // Give iOS CoreBluetooth a moment to complete CCCD notification subscription
+    await new Promise(r => setTimeout(r, 250));
+
     try {
-      // 1. Adapter reset & identification
-      const adapterModel = (await this.command('ATI', 4000)).replace(/[\r\n>]/g, ' ').trim() || 'vLinker BM+ / ELM327';
+      // 1. Adapter identification (retry once if first prompt wakes adapter from sleep)
+      let atiRaw = '';
+      try {
+        atiRaw = await this.command('ATI', 4000);
+      } catch {
+        atiRaw = await this.command('ATI', 4000);
+      }
+      const adapterModel = atiRaw.replace(/[\r\n>]/g, ' ').trim() || 'vLinker BM+ / ELM327';
 
       // 2. Configure ELM327 / STN communication parameters
-      await this.command('ATE0', 2000); // Echo Off
-      await this.command('ATL0', 2000); // Linefeeds Off
-      await this.command('ATS0', 2000); // Spaces Off
-      await this.command('ATH0', 2000); // Headers Off
-      await this.command('ATAT1', 2000); // Adaptive Timing Auto 1
-      await this.command('ATAL', 2000); // Allow Long messages (ISO-TP)
+      await this.command('ATE0', 2500); // Echo Off
+      await this.command('ATL0', 2500); // Linefeeds Off
+      await this.command('ATS0', 2500); // Spaces Off
+      await this.command('ATH0', 2500); // Headers Off
+      await this.command('ATAT1', 2500); // Adaptive Timing Auto 1
+      await this.command('ATAL', 2500); // Allow Long messages (ISO-TP)
       await this.command('ATSP0', 6000); // Automatic Protocol Search
 
       // 3. Read battery voltage from pin 16
@@ -308,16 +417,18 @@ export class ObdBleClient {
         if (!isNaN(vNum)) voltage = vNum;
       } catch {}
 
-      // 4. Query detected vehicle protocol
-      const protoRaw = await this.command('ATDP', 4000);
-      const protocol = protoRaw.replace(/[\r\n>]/g, '').trim() || 'ISO 15765-4 (CAN)';
-
-      // 5. Test ECU response with Mode 01 PID 00
-      const ecuTest = await this.command('0100', 8000);
-      if (/NO DATA|UNABLE TO CONNECT|BUS INIT|STOPPED/i.test(ecuTest)) {
-        throw new Error(
-          'Bluetooth veza sa adapterom je uspostavljena, ali motorni računar vozila nije odgovorio. Proveri da je kontakt uključen i da je VLinker BM+ čvrsto spojen na OBD-II port.'
-        );
+      // 4. Test ECU response with Mode 01 PID 00 (keep adapter connected even if ignition is off)
+      let protocol = 'ISO 15765-4 (CAN)';
+      try {
+        const ecuTest = await this.command('0100', 8000);
+        if (/NO DATA|UNABLE TO CONNECT|BUS INIT|STOPPED/i.test(ecuTest)) {
+          protocol = 'Adapter povezan — ECU čeka kontakt';
+        } else {
+          const protoRaw = await this.command('ATDP', 4000);
+          protocol = protoRaw.replace(/[\r\n>]/g, '').trim() || 'ISO 15765-4 (CAN)';
+        }
+      } catch {
+        protocol = 'Adapter povezan — ECU čeka kontakt';
       }
 
       const deviceDisplayName = this.device?.name || this.device?.localName || 'vLinker BM+';

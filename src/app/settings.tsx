@@ -90,11 +90,23 @@ export default function SettingsScreen() {
 
     setDevices([]);
     setScanning(true);
-    setStatus('Tražim VLinker BM+ / ELM327 BLE adaptere...');
+    setStatus('Tražim samo VLinker BM+ / OBD BLE adaptere...');
     try {
-      await getClient().scan(d => {
-        setDevices(old => (old.some(x => x.id === d.id) ? old : [...old, d]));
-      }, 12);
+      await getClient().scan(
+        d => {
+          setDevices(old => {
+            if (old.some(x => x.id === d.id)) return old;
+            const next = [...old, d];
+            return next.sort((a, b) => {
+              if (a.alreadyConnected !== b.alreadyConnected) return a.alreadyConnected ? -1 : 1;
+              if (a.isKnownObd !== b.isKnownObd) return a.isKnownObd ? -1 : 1;
+              return (b.rssi ?? -120) - (a.rssi ?? -120);
+            });
+          });
+        },
+        12,
+        { onlyObdAdapters: true }
+      );
       setStatus('Pretraga završena');
     } catch (e: any) {
       setStatus('Greška pri skeniranju');
@@ -146,7 +158,7 @@ export default function SettingsScreen() {
   };
 
   const scanVehicleCapabilities = async () => {
-    if (!client.current || !connected) return;
+    if (!client.current || !client.current.isConnected) return;
     setScanningCaps(true);
     try {
       const caps = await client.current.scanCapabilities();
@@ -256,20 +268,25 @@ export default function SettingsScreen() {
 
         {!scanning && devices.length === 0 && status === 'Pretraga završena' && (
           <Text style={s.hint}>
-            Nije pronađen Bluetooth adapter. Proveri da je VLinker BM+ utaknut u OBD priključak, da svetli LED dioda na adapteru i da je kontakt uključen.
+            Nije pronađen nijedan OBD/vLinker BLE adapter. Proveri da je vLinker BM+ utaknut u OBD port (svetli LED) i da NIJE povezan kao Classic Bluetooth (vLinker BM-Android) u iPhone podešavanjima — za iPhone se povezuje direktno ovde na vLinker BM-IOS (BLE 4.0).
           </Text>
         )}
 
         {devices.map(d => (
           <TouchableOpacity key={d.id} style={s.device} onPress={() => connect(d)} disabled={connecting}>
             <View style={{ flex: 1 }}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                 <Text style={s.item}>{d.name}</Text>
-                {d.isKnownObd && <View style={s.knownBadge}><Text style={s.knownBadgeText}>OBD</Text></View>}
+                {d.alreadyConnected && (
+                  <View style={[s.knownBadge, { backgroundColor: '#059669' }]}>
+                    <Text style={s.knownBadgeText}>POVEZAN</Text>
+                  </View>
+                )}
+                {d.isKnownObd && <View style={s.knownBadge}><Text style={s.knownBadgeText}>VLINKER / OBD</Text></View>}
               </View>
               <Text style={s.hint}>BLE · {d.id.slice(0, 18)}…</Text>
             </View>
-            <Text style={s.value}>{d.rssi ?? '—'} dBm　›</Text>
+            <Text style={s.value}>{d.rssi != null ? `${d.rssi} dBm` : 'BLE'}　›</Text>
           </TouchableOpacity>
         ))}
 
@@ -437,9 +454,9 @@ function metric(label: string, value: number | undefined, unit: string) {
 
 const s = StyleSheet.create({
   page: { flex: 1, backgroundColor: '#080810' },
-  content: { padding: 24, paddingTop: 62, paddingBottom: 40 },
+  content: { padding: 24, paddingTop: 76, paddingBottom: 110 },
   brand: { color: '#A855F7', fontSize: 12, fontWeight: '900', letterSpacing: 5 },
-  title: { color: '#fff', fontSize: 30, fontWeight: '900', marginTop: 34 },
+  title: { color: '#fff', fontSize: 30, fontWeight: '900', marginTop: 12 },
   sub: { color: '#888397', fontSize: 10, letterSpacing: 3, marginTop: 5, marginBottom: 28 },
   section: { color: '#A855F7', fontSize: 10, fontWeight: '900', letterSpacing: 2, marginTop: 23, marginBottom: 10 },
   card: { backgroundColor: '#15121F', borderColor: '#30263B', borderWidth: 1, borderRadius: 13, padding: 16, marginBottom: 9, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
