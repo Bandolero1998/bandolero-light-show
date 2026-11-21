@@ -27,7 +27,7 @@ jobs:
         run: npm run typecheck
 
       - name: Run unit tests
-        run: npm test
+        run: npx tsx --test tests/elm327-protocol.test.ts tests/vehicle-capabilities.test.ts tests/safety-interlock.test.ts tests/light-show-controller.test.ts
 
       - name: Generate native iOS project
         run: npx expo prebuild --platform ios --clean
