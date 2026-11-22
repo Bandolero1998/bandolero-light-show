@@ -179,17 +179,17 @@ export type Tp20Channel = {
 
 /**
  * Parses a VW TP 2.0 Channel Setup positive response on CAN ID 0x209:
- * Format: 00 D0 <rx_lo> <rx_hi> <tx_lo> <tx_hi> 01
+ * Format: <addr> D0 <rx_lo> <rx_hi> <tx_lo> <tx_hi> 01  (addr is typically 00 or 09)
  * where rx = tester RX (ECU TX, ATCRA) and tx = ECU RX (tester TX, ATSH).
  */
 export function parseTp20SetupResponse(rawResponse: string): Tp20Channel | null {
   const clean = Elm327Protocol.cleanResponse(rawResponse);
-  const idx = clean.indexOf('00D0');
-  if (idx === -1 || clean.length < idx + 12) return null;
-  const rxLo = parseInt(clean.slice(idx + 4, idx + 6), 16);
-  const rxHi = parseInt(clean.slice(idx + 6, idx + 8), 16);
-  const txLo = parseInt(clean.slice(idx + 8, idx + 10), 16);
-  const txHi = parseInt(clean.slice(idx + 10, idx + 12), 16);
+  const match = clean.match(/[0-9A-F]{2}D0([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})/);
+  if (!match) return null;
+  const rxLo = parseInt(match[1], 16);
+  const rxHi = parseInt(match[2], 16);
+  const txLo = parseInt(match[3], 16);
+  const txHi = parseInt(match[4], 16);
   if ([rxLo, rxHi, txLo, txHi].some(isNaN)) return null;
 
   const ecuTxId = ((rxHi & 0x07) << 8) | rxLo;
@@ -843,12 +843,12 @@ export class LightShowController {
       }
 
       // 2A. First probe VW TP 2.0 (KWP2000 over CAN) on Module 09 (0x200 -> 0x209)
-      // Many 2010 Audi A8 D4 (4H) BCM1 modules (4H0 907 063) use VW TP 2.0 rather than ISO-TP UDS 0x70E!
       onProgress?.('Provera VW TP 2.0 protokola na Modulu 09 (0x200 → 0x209)...', 10);
       await this.exec('ATCAF0', 1500).catch(() => {});
       await this.exec('ATSH 200', 2000).catch(() => {});
       await this.exec('ATCRA 209', 2000).catch(() => {});
       const tp20SetupRaw = await this.exec('09 C0 00 10 00 03 01', 2500).catch(() => '');
+      const tp20RawClean = Elm327Protocol.cleanResponse(tp20SetupRaw) || 'NO DATA';
       const tp20Chan = parseTp20SetupResponse(tp20SetupRaw);
 
       if (tp20Chan) {
@@ -864,14 +864,12 @@ export class LightShowController {
         const cleanParam = Elm327Protocol.cleanResponse(paramResp);
         this.log('INFO', `TP 2.0 parametri (A0 → A1): ${cleanParam || 'NO DATA'}`);
 
-        // Open KWP2000 Extended Session (10 89) and read ECU Part Number (1A 9B)
         const kwpSess = await this.exec('10 00 02 10 89', 2500).catch(() => '');
         const cleanKwpSess = Elm327Protocol.cleanResponse(kwpSess);
         await this.exec('B1', 1200).catch(() => {});
         const kwpIdRaw = await this.exec('11 00 02 1A 9B', 2500).catch(() => '');
         const kwpPart = decodeUdsAsciiPayload(kwpIdRaw, '5A9B') || decodeUdsAsciiPayload(kwpIdRaw, '344830');
 
-        // Close TP 2.0 channel cleanly (A8) and restore ELM327 defaults
         await this.exec('A8', 1500).catch(() => {});
         await this.restoreObdDefaults();
 
@@ -887,39 +885,104 @@ export class LightShowController {
         };
       }
 
-      // Restore ATCAF1 before UDS ISO-TP scan
+      // Restore ATCAF1 before UDS ISO-TP discovery
       await this.exec('ATCAF1', 1500).catch(() => {});
+      this.log('INFO', `TP 2.0 (0x200→0x209) odgovor: ${tp20RawClean} — tražim BCM1 (4H0 907 063) po UDS CAN adresama...`);
 
-      // 2B. Identify active UDS Module target WITH proper ISO-TP Flow Control (ATFCSH/ATFCSM 1)
-      let activeTarget = LightShowController.MODULE09_TARGETS[0];
+      // 2B. Scan VAG MLB / Audi A8 D4 UDS CAN addresses to find real BCM1 (4H0907063 / 8K0907063)
+      // Note: 0x710/0x77A is J533 CAN Gateway (4H0907468), NOT BCM1!
+      const udsCandidates = [
+        { tx: '70E', rx: '778', label: '0x70E/0x778 (BCM1 std)' },
+        { tx: '740', rx: '7AA', label: '0x740/0x7AA (BCM1/Body)' },
+        { tx: '765', rx: '7CF', label: '0x765/0x7CF (BCM2/Comfort)' },
+        { tx: '720', rx: '78A', label: '0x720/0x78A (55 Headlight/AFS)' },
+        { tx: '74C', rx: '7B6', label: '0x74C/0x7B6 (Headlight alt)' },
+        { tx: '700', rx: '76A', label: '0x700/0x76A' },
+        { tx: '701', rx: '76B', label: '0x701/0x76B' },
+        { tx: '702', rx: '76C', label: '0x702/0x76C' },
+        { tx: '703', rx: '76D', label: '0x703/0x76D' },
+        { tx: '704', rx: '76E', label: '0x704/0x76E' },
+        { tx: '705', rx: '76F', label: '0x705/0x76F' },
+        { tx: '706', rx: '770', label: '0x706/0x770' },
+        { tx: '707', rx: '771', label: '0x707/0x771' },
+        { tx: '708', rx: '772', label: '0x708/0x772' },
+        { tx: '709', rx: '773', label: '0x709/0x773' },
+        { tx: '70A', rx: '774', label: '0x70A/0x774' },
+        { tx: '70B', rx: '775', label: '0x70B/0x775' },
+        { tx: '70C', rx: '776', label: '0x70C/0x776' },
+        { tx: '70D', rx: '777', label: '0x70D/0x777' },
+        { tx: '70F', rx: '779', label: '0x70F/0x779' },
+        { tx: '710', rx: '77A', label: '0x710/0x77A (Gateway J533)' },
+      ];
+
+      let activeTarget = udsCandidates[0];
       let partNumber: string | null = null;
       let systemName: string | null = null;
       let sessionResponse = 'NO DATA';
+      const foundModules: string[] = [];
 
-      for (const target of LightShowController.MODULE09_TARGETS) {
+      // Speed up non-responding CAN probes slightly (ATST 19 = 100ms)
+      await this.client.command('ATST 19', 1200).catch(() => {});
+
+      for (let idx = 0; idx < udsCandidates.length; idx++) {
         if (this.abortRequested) break;
-        onProgress?.(`Identifikacija ${target.label} (22 F1 87)...`, 15);
+        const target = udsCandidates[idx];
+        onProgress?.(`Tražim BCM1 na ${target.label} (${idx + 1}/${udsCandidates.length})...`, 12 + Math.round((idx / udsCandidates.length) * 20));
         await this.configureUdsTarget(target.tx, target.rx);
 
-        const pnRaw = await this.exec('22 F1 87', 3000).catch(() => '');
+        const pnRaw = await this.client.command('22 F1 87', 1800).catch(() => '');
         const pn = decodeUdsAsciiPayload(pnRaw, '62F187');
-        const snRaw = await this.exec('22 F1 97', 2500).catch(() => '');
-        const sn = decodeUdsAsciiPayload(snRaw, '62F197');
-        const sessRaw = await this.exec('10 03', 3000).catch(() => '');
-        const cleanSess = Elm327Protocol.cleanResponse(sessRaw);
+        if (!pn) continue;
 
-        if (pn || sn || cleanSess.includes('5003') || cleanSess.includes('7F10')) {
+        const snRaw = await this.client.command('22 F1 97', 1800).catch(() => '');
+        const sn = decodeUdsAsciiPayload(snRaw, '62F197');
+        foundModules.push(`0x${target.tx}: ${pn}${sn ? ` (${sn})` : ''}`);
+        this.log('INFO', `Pronađen ECU na 0x${target.tx}/0x${target.rx}: ${pn} ${sn || ''}`);
+
+        // Prefer real BCM1 (4H0907063 / 8K0907063 / BCM1 / Centr.Elect) over J533 Gateway!
+        const isBcm = /063|BCM1|J519|CENT/i.test(`${pn} ${sn || ''}`);
+        const isGateway = /468|J533|GATEWAY/i.test(`${pn} ${sn || ''}`);
+
+        if (isBcm || (!partNumber && !isGateway)) {
           activeTarget = target;
           partNumber = pn;
           systemName = sn;
-          sessionResponse = cleanSess || 'NO DATA';
-          this.udsSessionActive = true;
-          this.log(
-            'INFO',
-            `Pronađen UDS modul na ${target.label}: Part#=${pn || 'nepoznat'}, Name=${sn || 'nepoznat'}, Session=${sessionResponse}`
-          );
-          break;
+          if (isBcm) break;
+        } else if (!partNumber) {
+          activeTarget = target;
+          partNumber = pn;
+          systemName = sn;
         }
+      }
+
+      // Restore normal ELM327 timeout
+      await this.client.command('ATST 32', 1200).catch(() => {});
+
+      if (!partNumber) {
+        throw new Error(`Nijedan UDS modul nije pronađen (TP2.0 0x209: ${tp20RawClean}). Proveri kontakt.`);
+      }
+
+      // Open Extended Session on the selected module
+      await this.configureUdsTarget(activeTarget.tx, activeTarget.rx);
+      const sessRaw = await this.exec('10 03', 3000).catch(() => '');
+      sessionResponse = Elm327Protocol.cleanResponse(sessRaw) || 'NO DATA';
+      this.udsSessionActive = true;
+
+      // If only Gateway was found (no BCM1 on UDS), return module map immediately without wasting 10s scanning Gateway DIDs
+      if (/468|J533|GATEWAY/i.test(`${partNumber} ${systemName || ''}`)) {
+        await this.exec('10 01', 2000).catch(() => {});
+        this.udsSessionActive = false;
+        await this.restoreObdDefaults();
+        onProgress?.('Skeniranje završeno.', 100);
+        return {
+          targetLabel: `${activeTarget.label} | TP2.0(209)=${tp20RawClean}`,
+          protocol: 'UDS (ISO-TP)',
+          partNumber,
+          systemName: `${systemName || 'Gateway'} | Nađeni: ${foundModules.join('; ')}`,
+          sessionResponse,
+          discoveredDids: [],
+          scannedCount: udsCandidates.length,
+        };
       }
 
       if (!this.udsSessionActive) {
