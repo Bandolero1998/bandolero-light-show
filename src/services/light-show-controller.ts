@@ -167,6 +167,9 @@ export type Module09ScanResult = {
   partNumber: string | null;
   systemName: string | null;
   sessionResponse: string;
+  longCodingHex?: string | null;
+  tp20RawResponse?: string;
+  allFoundModules?: string[];
   discoveredDids: DiscoveredDid[];
   scannedCount: number;
 };
@@ -842,35 +845,36 @@ export class LightShowController {
         throw new Error(`VOZILO U POKRETU (${speed} km/h) — skeniranje je blokirano dok vozilo ne stane.`);
       }
 
-      // 2A. First probe VW TP 2.0 (KWP2000 over CAN) on Module 09 (0x200 -> 0x209)
-      onProgress?.('Provera VW TP 2.0 protokola na Modulu 09 (0x200 → 0x209)...', 10);
-      await this.exec('ATCAF0', 1500).catch(() => {});
-      await this.exec('ATSH 200', 2000).catch(() => {});
-      await this.exec('ATCRA 209', 2000).catch(() => {});
-      const tp20SetupRaw = await this.exec('09 C0 00 10 00 03 01', 2500).catch(() => '');
+      // 2A. Probe VW TP 2.0 (KWP2000 over CAN) on Module 09 (0x200 -> 0x209)
+      onProgress?.('1/3 Provera VW TP 2.0 (0x200 → 0x209)...', 6);
+      await this.client.command('ATCAF0', 1500).catch(() => {});
+      await this.client.command('ATSH 200', 2000).catch(() => {});
+      await this.client.command('ATCRA 209', 2000).catch(() => {});
+      const tp20SetupRaw = await this.client.command('09 C0 00 10 00 03 01', 2200).catch(() => '');
       const tp20RawClean = Elm327Protocol.cleanResponse(tp20SetupRaw) || 'NO DATA';
       const tp20Chan = parseTp20SetupResponse(tp20SetupRaw);
+      this.log('INFO', `TP 2.0 (0x200→0x209): ${tp20RawClean}`);
 
       if (tp20Chan) {
         this.log(
           'INFO',
-          `✅ MODUL 09 KORISTI VW TP 2.0 (KWP2000)! Kanal otvoren: TX=0x${tp20Chan.ecuRxHex}, RX=0x${tp20Chan.ecuTxHex}`
+          `✅ MODUL 09 KORISTI VW TP 2.0! TX=0x${tp20Chan.ecuRxHex}, RX=0x${tp20Chan.ecuTxHex}`
         );
-        onProgress?.(`TP 2.0 kanal otvoren (0x${tp20Chan.ecuRxHex} / 0x${tp20Chan.ecuTxHex})...`, 40);
+        onProgress?.(`TP 2.0 otvoren (0x${tp20Chan.ecuRxHex}/0x${tp20Chan.ecuTxHex})...`, 40);
 
-        await this.exec(`ATSH ${tp20Chan.ecuRxHex}`, 2000).catch(() => {});
-        await this.exec(`ATCRA ${tp20Chan.ecuTxHex}`, 2000).catch(() => {});
-        const paramResp = await this.exec('A0 0F 8A FF 32 FF', 2500).catch(() => '');
+        await this.client.command(`ATSH ${tp20Chan.ecuRxHex}`, 2000).catch(() => {});
+        await this.client.command(`ATCRA ${tp20Chan.ecuTxHex}`, 2000).catch(() => {});
+        const paramResp = await this.client.command('A0 0F 8A FF 32 FF', 2500).catch(() => '');
         const cleanParam = Elm327Protocol.cleanResponse(paramResp);
-        this.log('INFO', `TP 2.0 parametri (A0 → A1): ${cleanParam || 'NO DATA'}`);
+        this.log('INFO', `TP 2.0 A0→A1: ${cleanParam || 'NO DATA'}`);
 
-        const kwpSess = await this.exec('10 00 02 10 89', 2500).catch(() => '');
+        const kwpSess = await this.client.command('10 00 02 10 89', 2500).catch(() => '');
         const cleanKwpSess = Elm327Protocol.cleanResponse(kwpSess);
-        await this.exec('B1', 1200).catch(() => {});
-        const kwpIdRaw = await this.exec('11 00 02 1A 9B', 2500).catch(() => '');
+        await this.client.command('B1', 1200).catch(() => {});
+        const kwpIdRaw = await this.client.command('11 00 02 1A 9B', 2500).catch(() => '');
         const kwpPart = decodeUdsAsciiPayload(kwpIdRaw, '5A9B') || decodeUdsAsciiPayload(kwpIdRaw, '344830');
 
-        await this.exec('A8', 1500).catch(() => {});
+        await this.client.command('A8', 1500).catch(() => {});
         await this.restoreObdDefaults();
 
         onProgress?.('TP 2.0 detekcija završena.', 100);
@@ -880,76 +884,58 @@ export class LightShowController {
           partNumber: kwpPart || `TP2.0 OK (${tp20Chan.rawClean})`,
           systemName: 'BCM1 (VW TP 2.0 / KWP2000)',
           sessionResponse: cleanKwpSess || cleanParam || 'D0 OK',
+          tp20RawResponse: tp20RawClean,
+          allFoundModules: [`TP2.0 0x09: TX 0x${tp20Chan.ecuRxHex}/RX 0x${tp20Chan.ecuTxHex} (${kwpPart || tp20RawClean})`],
           discoveredDids: [],
           scannedCount: 0,
         };
       }
 
-      // Restore ATCAF1 before UDS ISO-TP discovery
-      await this.exec('ATCAF1', 1500).catch(() => {});
-      this.log('INFO', `TP 2.0 (0x200→0x209) odgovor: ${tp20RawClean} — tražim BCM1 (4H0 907 063) po UDS CAN adresama...`);
+      // 2B. Full silent UDS scan of ALL 112 VAG 11-bit CAN IDs (0x700–0x76F, response +0x6A)
+      // Uses ATST 14 (80ms) and direct client.command so TX/RX log stays clean with only real ECUs!
+      await this.client.command('ATCAF1', 1500).catch(() => {});
+      await this.client.command('ATFCSD 300000', 1500).catch(() => {});
+      await this.client.command('ATFCSM 1', 1500).catch(() => {});
+      await this.client.command('ATST 14', 1200).catch(() => {});
 
-      // 2B. Scan VAG MLB / Audi A8 D4 UDS CAN addresses to find real BCM1 (4H0907063 / 8K0907063)
-      // Note: 0x710/0x77A is J533 CAN Gateway (4H0907468), NOT BCM1!
-      const udsCandidates = [
-        { tx: '70E', rx: '778', label: '0x70E/0x778 (BCM1 std)' },
-        { tx: '740', rx: '7AA', label: '0x740/0x7AA (BCM1/Body)' },
-        { tx: '765', rx: '7CF', label: '0x765/0x7CF (BCM2/Comfort)' },
-        { tx: '720', rx: '78A', label: '0x720/0x78A (55 Headlight/AFS)' },
-        { tx: '74C', rx: '7B6', label: '0x74C/0x7B6 (Headlight alt)' },
-        { tx: '700', rx: '76A', label: '0x700/0x76A' },
-        { tx: '701', rx: '76B', label: '0x701/0x76B' },
-        { tx: '702', rx: '76C', label: '0x702/0x76C' },
-        { tx: '703', rx: '76D', label: '0x703/0x76D' },
-        { tx: '704', rx: '76E', label: '0x704/0x76E' },
-        { tx: '705', rx: '76F', label: '0x705/0x76F' },
-        { tx: '706', rx: '770', label: '0x706/0x770' },
-        { tx: '707', rx: '771', label: '0x707/0x771' },
-        { tx: '708', rx: '772', label: '0x708/0x772' },
-        { tx: '709', rx: '773', label: '0x709/0x773' },
-        { tx: '70A', rx: '774', label: '0x70A/0x774' },
-        { tx: '70B', rx: '775', label: '0x70B/0x775' },
-        { tx: '70C', rx: '776', label: '0x70C/0x776' },
-        { tx: '70D', rx: '777', label: '0x70D/0x777' },
-        { tx: '70F', rx: '779', label: '0x70F/0x779' },
-        { tx: '710', rx: '77A', label: '0x710/0x77A (Gateway J533)' },
-      ];
-
-      let activeTarget = udsCandidates[0];
+      let bcmTarget: { tx: string; rx: string; label: string } | null = null;
       let partNumber: string | null = null;
       let systemName: string | null = null;
       let sessionResponse = 'NO DATA';
+      let longCodingHex: string | null = null;
       const foundModules: string[] = [];
 
-      // Speed up non-responding CAN probes slightly (ATST 19 = 100ms)
-      await this.client.command('ATST 19', 1200).catch(() => {});
-
-      for (let idx = 0; idx < udsCandidates.length; idx++) {
+      const totalIds = 0x76f - 0x700 + 1; // 112 CAN IDs
+      for (let id = 0x700; id <= 0x76f; id++) {
         if (this.abortRequested) break;
-        const target = udsCandidates[idx];
-        onProgress?.(`Tražim BCM1 na ${target.label} (${idx + 1}/${udsCandidates.length})...`, 12 + Math.round((idx / udsCandidates.length) * 20));
-        await this.configureUdsTarget(target.tx, target.rx);
+        const idx = id - 0x700;
+        const tx = id.toString(16).toUpperCase().padStart(3, '0');
+        const rx = (id + 0x6a).toString(16).toUpperCase().padStart(3, '0');
 
-        const pnRaw = await this.client.command('22 F1 87', 1800).catch(() => '');
+        if (idx % 8 === 0) {
+          onProgress?.(
+            `2/3 Skeniram sve UDS module: 0x${tx} (${idx}/${totalIds}) · nađeno: ${foundModules.length}`,
+            10 + Math.round((idx / totalIds) * 50)
+          );
+        }
+
+        await this.client.command(`ATSH ${tx}`, 1200).catch(() => {});
+        await this.client.command(`ATCRA ${rx}`, 1200).catch(() => {});
+        await this.client.command(`ATFCSH ${tx}`, 1200).catch(() => {});
+
+        const pnRaw = await this.client.command('22 F1 87', 1200).catch(() => '');
         const pn = decodeUdsAsciiPayload(pnRaw, '62F187');
         if (!pn) continue;
 
-        const snRaw = await this.client.command('22 F1 97', 1800).catch(() => '');
+        const snRaw = await this.client.command('22 F1 97', 1500).catch(() => '');
         const sn = decodeUdsAsciiPayload(snRaw, '62F197');
-        foundModules.push(`0x${target.tx}: ${pn}${sn ? ` (${sn})` : ''}`);
-        this.log('INFO', `Pronađen ECU na 0x${target.tx}/0x${target.rx}: ${pn} ${sn || ''}`);
+        const entry = `0x${tx}/0x${rx}: ${pn}${sn ? ` (${sn})` : ''}`;
+        foundModules.push(entry);
+        this.log('INFO', `✅ ECU ${entry}`);
 
-        // Prefer real BCM1 (4H0907063 / 8K0907063 / BCM1 / Centr.Elect) over J533 Gateway!
-        const isBcm = /063|BCM1|J519|CENT/i.test(`${pn} ${sn || ''}`);
-        const isGateway = /468|J533|GATEWAY/i.test(`${pn} ${sn || ''}`);
-
-        if (isBcm || (!partNumber && !isGateway)) {
-          activeTarget = target;
-          partNumber = pn;
-          systemName = sn;
-          if (isBcm) break;
-        } else if (!partNumber) {
-          activeTarget = target;
+        const isBcm = /063|BCM1|J519|CENTR|BORDNETZ/i.test(`${pn} ${sn || ''}`);
+        if (isBcm && !bcmTarget) {
+          bcmTarget = { tx, rx, label: `0x${tx}/0x${rx} (BCM1)` };
           partNumber = pn;
           systemName = sn;
         }
@@ -958,32 +944,40 @@ export class LightShowController {
       // Restore normal ELM327 timeout
       await this.client.command('ATST 32', 1200).catch(() => {});
 
-      if (!partNumber) {
-        throw new Error(`Nijedan UDS modul nije pronađen (TP2.0 0x209: ${tp20RawClean}). Proveri kontakt.`);
+      if (!bcmTarget) {
+        await this.restoreObdDefaults();
+        onProgress?.('Kompletan sken završen.', 100);
+        this.log('INFO', `Skenirano svih 112 CAN adresa. Ukupno pronađeno UDS modula: ${foundModules.length}.`);
+        return {
+          targetLabel: `Skenirano 0x700–0x76F | TP2.0(209)=${tp20RawClean}`,
+          protocol: 'UDS (ISO-TP)',
+          partNumber: foundModules.length > 0 ? `Nađeno ${foundModules.length} modula (nema 4H0907063 na 0x700–0x76F)` : 'Nijedan modul',
+          systemName: foundModules.join('\n') || 'Nijedan UDS modul nije odgovorio',
+          sessionResponse: 'N/A',
+          longCodingHex: null,
+          tp20RawResponse: tp20RawClean,
+          allFoundModules: foundModules,
+          discoveredDids: [],
+          scannedCount: totalIds,
+        };
       }
 
-      // Open Extended Session on the selected module
+      // 3. Real BCM1 FOUND! Read its factory Long Coding (22 06 00) for EU<->US LED backup & open 10 03
+      const activeTarget = bcmTarget;
+      onProgress?.(`3/3 Pronađen BCM1 (${activeTarget.label})! Čitam Long Coding i DID-ove...`, 65);
       await this.configureUdsTarget(activeTarget.tx, activeTarget.rx);
+
+      const lcRaw = await this.client.command('22 06 00', 2500).catch(() => '');
+      const lcClean = Elm327Protocol.reassembleIsoTp(lcRaw);
+      const lcIdx = lcClean.indexOf('620600');
+      if (lcIdx !== -1) {
+        longCodingHex = lcClean.slice(lcIdx + 6);
+        this.log('INFO', `💾 BCM1 Long Coding (EU backup): ${longCodingHex}`);
+      }
+
       const sessRaw = await this.exec('10 03', 3000).catch(() => '');
       sessionResponse = Elm327Protocol.cleanResponse(sessRaw) || 'NO DATA';
       this.udsSessionActive = true;
-
-      // If only Gateway was found (no BCM1 on UDS), return module map immediately without wasting 10s scanning Gateway DIDs
-      if (/468|J533|GATEWAY/i.test(`${partNumber} ${systemName || ''}`)) {
-        await this.exec('10 01', 2000).catch(() => {});
-        this.udsSessionActive = false;
-        await this.restoreObdDefaults();
-        onProgress?.('Skeniranje završeno.', 100);
-        return {
-          targetLabel: `${activeTarget.label} | TP2.0(209)=${tp20RawClean}`,
-          protocol: 'UDS (ISO-TP)',
-          partNumber,
-          systemName: `${systemName || 'Gateway'} | Nađeni: ${foundModules.join('; ')}`,
-          sessionResponse,
-          discoveredDids: [],
-          scannedCount: udsCandidates.length,
-        };
-      }
 
       if (!this.udsSessionActive) {
         throw new Error('Modul 09 nije odgovorio ni na 0x70E ni na 0x710. Proveri da li je kontakt uključen.');
@@ -1065,6 +1059,9 @@ export class LightShowController {
         partNumber,
         systemName,
         sessionResponse,
+        longCodingHex,
+        tp20RawResponse: tp20RawClean,
+        allFoundModules: foundModules,
         discoveredDids,
         scannedCount,
       };

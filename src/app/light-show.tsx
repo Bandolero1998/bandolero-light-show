@@ -636,8 +636,19 @@ export default function LightShowScreen() {
                   Part #: {scanResult.partNumber || 'N/A'} · Naziv: {scanResult.systemName || 'N/A'}
                 </Text>
                 <Text style={s.scanResultMeta}>
-                  10 03: {scanResult.sessionResponse} · Skenirano: {scanResult.scannedCount} DID-ova
+                  10 03: {scanResult.sessionResponse} · Skenirano: {scanResult.scannedCount}
                 </Text>
+                {scanResult.longCodingHex && (
+                  <Text style={[s.scanResultMeta, { color: '#34D399' }]}>
+                    Long Coding: {scanResult.longCodingHex}
+                  </Text>
+                )}
+                {scanResult.allFoundModules && scanResult.allFoundModules.length > 0 && (
+                  <Text style={[s.scanResultMeta, { color: '#93C5FD', marginTop: 4 }]}>
+                    Svi moduli ({scanResult.allFoundModules.length}):{'\n'}
+                    {scanResult.allFoundModules.join('\n')}
+                  </Text>
+                )}
                 {scanResult.discoveredDids.length > 0 ? (
                   <View style={s.didChipWrap}>
                     {scanResult.discoveredDids.map(item => (
