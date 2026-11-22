@@ -147,6 +147,58 @@ export type CommandLogEntry = {
   text: string;
 };
 
+export type Uds2fResult = {
+  accepted: boolean;
+  nrc?: string;
+  nrcDescription?: string;
+  rawClean: string;
+};
+
+const UDS_NRC_DESCRIPTIONS: Record<string, string> = {
+  '11': 'ServiceNotSupported (usluga 2F nije podržana)',
+  '12': 'SubFunctionNotSupported (nepodržana podfunkcija)',
+  '13': 'IncorrectMessageLengthOrInvalidFormat (pogrešna dužina ili format poruke)',
+  '22': 'ConditionsNotCorrect (pogrešni uslovi — proveri kontakt / motor / brzinu)',
+  '24': 'RequestSequenceError (pogrešan redosled komandi)',
+  '31': 'RequestOutOfRange (pogrešan DID — adresa ne postoji na BCM1)',
+  '33': 'SecurityAccessDenied (potreban Security Access za Modul 09)',
+  '78': 'ResponsePending (modul obrađuje zahtev)',
+  '7E': 'SubFunctionNotSupportedInActiveSession (ne radi u trenutnoj sesiji)',
+  '7F': 'ServiceNotSupportedInActiveSession (2F nije podržan u ovoj sesiji)',
+};
+
+export function parseUds2fResponse(rawResponse: string): Uds2fResult {
+  const clean = Elm327Protocol.cleanResponse(rawResponse);
+  if (clean.includes('6F')) {
+    return { accepted: true, rawClean: clean };
+  }
+  const negMatch = clean.match(/7F2F([0-9A-F]{2})/);
+  if (negMatch) {
+    const nrc = negMatch[1];
+    return {
+      accepted: false,
+      nrc,
+      nrcDescription: UDS_NRC_DESCRIPTIONS[nrc] || `Nepoznat UDS NRC kod (0x${nrc})`,
+      rawClean: clean,
+    };
+  }
+  const anyNeg = clean.match(/7F[0-9A-F]{2}([0-9A-F]{2})/);
+  if (anyNeg) {
+    const nrc = anyNeg[1];
+    return {
+      accepted: false,
+      nrc,
+      nrcDescription: UDS_NRC_DESCRIPTIONS[nrc] || `UDS negativan odgovor (NRC 0x${nrc})`,
+      rawClean: clean,
+    };
+  }
+  return {
+    accepted: false,
+    nrcDescription: clean ? `Neočekivan odgovor (${clean})` : 'Nema odgovora (NO DATA)',
+    rawClean: clean,
+  };
+}
+
 export class LightShowController {
   private client: ObdBleClient | null = null;
   private isRunning = false;
@@ -154,6 +206,12 @@ export class LightShowController {
   private udsSessionActive = false;
   private testerPresentTimer: ReturnType<typeof setInterval> | null = null;
   private logCallback?: (entry: CommandLogEntry) => void;
+  private actuatorStats: {
+    accepted: number;
+    rejected: number;
+    lastNrc?: string;
+    lastNrcDescription?: string;
+  } = { accepted: 0, rejected: 0 };
 
   /**
    * Audi A8 D4 (4H) / VAG UDS physical CAN Tx/Rx pairs for Module 09 (BCM1 / Central Electrics).
@@ -249,14 +307,34 @@ export class LightShowController {
   }
 
   /**
+   * Sends a UDS 0x2F (IO Control) actuator command and evaluates 6F (positive) vs 7F (negative).
+   */
+  private async exec2f(cmd: string, timeout = 1500): Promise<Uds2fResult> {
+    const rx = await this.exec(cmd, timeout);
+    const parsed = parseUds2fResponse(rx);
+    if (parsed.accepted) {
+      this.actuatorStats.accepted++;
+    } else {
+      this.actuatorStats.rejected++;
+      if (parsed.nrc) {
+        this.actuatorStats.lastNrc = parsed.nrc;
+        this.actuatorStats.lastNrcDescription = parsed.nrcDescription;
+      } else if (!this.actuatorStats.lastNrcDescription) {
+        this.actuatorStats.lastNrcDescription = parsed.nrcDescription;
+      }
+    }
+    return parsed;
+  }
+
+  /**
    * Pulses a specific UDS IO Control actuator a given number of times.
    */
   private async pulseActuator(didHex: string, count: number, onMs: number, offMs: number): Promise<void> {
     for (let i = 0; i < count; i++) {
       if (this.abortRequested) break;
-      await this.exec(`2F${didHex}03`, 1500);
+      await this.exec2f(`2F${didHex}03`, 1500);
       await this.sleep(onMs);
-      await this.exec(`2F${didHex}00`, 1500);
+      await this.exec2f(`2F${didHex}00`, 1500);
       if (i < count - 1) {
         await this.sleep(offMs);
       }
@@ -323,6 +401,7 @@ export class LightShowController {
     this.isRunning = true;
     this.abortRequested = false;
     this.udsSessionActive = false;
+    this.actuatorStats = { accepted: 0, rejected: 0 };
 
     this.log('INFO', `Započinjem sekvencu "${effectId.toUpperCase()}" na vozilu Audi A8 D4.`);
     this.log('INFO', 'Korak 1: Resetovanje CAN headera (7DF) i provera brzine (010D).');
@@ -423,11 +502,11 @@ export class LightShowController {
         // Dual Sync Police Flash: Both headlights double-flash together with pause
         for (let c = 0; c < 3 && !this.abortRequested; c++) {
           for (let f = 0; f < 2 && !this.abortRequested; f++) {
-            await this.exec('2F010503', 1500);
-            await this.exec('2F010603', 1500);
+            await this.exec2f('2F010503', 1500);
+            await this.exec2f('2F010603', 1500);
             await this.sleep(110);
-            await this.exec('2F010500', 1500);
-            await this.exec('2F010600', 1500);
+            await this.exec2f('2F010500', 1500);
+            await this.exec2f('2F010600', 1500);
             await this.sleep(90);
           }
           await this.sleep(320);
@@ -435,17 +514,17 @@ export class LightShowController {
       } else if (effectId === 'police_pursuit') {
         // Cross-pattern: Left High + Right Fog -> Right High + Left Fog
         for (let c = 0; c < 3 && !this.abortRequested; c++) {
-          await this.exec('2F010503', 1500);
-          await this.exec('2F010803', 1500);
+          await this.exec2f('2F010503', 1500);
+          await this.exec2f('2F010803', 1500);
           await this.sleep(140);
-          await this.exec('2F010500', 1500);
-          await this.exec('2F010800', 1500);
+          await this.exec2f('2F010500', 1500);
+          await this.exec2f('2F010800', 1500);
           await this.sleep(80);
-          await this.exec('2F010603', 1500);
-          await this.exec('2F010703', 1500);
+          await this.exec2f('2F010603', 1500);
+          await this.exec2f('2F010703', 1500);
           await this.sleep(140);
-          await this.exec('2F010600', 1500);
-          await this.exec('2F010700', 1500);
+          await this.exec2f('2F010600', 1500);
+          await this.exec2f('2F010700', 1500);
           await this.sleep(80);
         }
       } else if (effectId === 'police_interceptor') {
@@ -457,41 +536,52 @@ export class LightShowController {
           await this.sleep(60);
         }
       } else if (effectId === 'welcome' || effectId === 'sweep') {
-        await this.exec('2F010203', 2000);
+        await this.exec2f('2F010203', 2000);
         await this.sleep(400);
-        await this.exec('2F010200', 2000);
+        await this.exec2f('2F010200', 2000);
         await this.sleep(200);
-        await this.exec('2F010303', 2000);
+        await this.exec2f('2F010303', 2000);
         await this.sleep(400);
-        await this.exec('2F010300', 2000);
+        await this.exec2f('2F010300', 2000);
       } else if (effectId === 'pulse' || effectId === 'hazard') {
         for (let cycle = 0; cycle < 2 && !this.abortRequested; cycle++) {
-          await this.exec('2F010203', 1500);
-          await this.exec('2F010303', 1500);
+          await this.exec2f('2F010203', 1500);
+          await this.exec2f('2F010303', 1500);
           await this.sleep(350);
-          await this.exec('2F010200', 1500);
-          await this.exec('2F010300', 1500);
+          await this.exec2f('2F010200', 1500);
+          await this.exec2f('2F010300', 1500);
           await this.sleep(250);
         }
       } else if (effectId === 'highbeam') {
-        await this.exec('2F010503', 2000);
+        await this.exec2f('2F010503', 2000);
         await this.sleep(400);
-        await this.exec('2F010500', 2000);
+        await this.exec2f('2F010500', 2000);
       }
 
       onProgress?.('Vraćanje kontrole modulu vozila (10 01 / ATSH 7DF)...', 90);
 
       // Step 5: Clean teardown — stop TesterPresent, return actuators, restore default session & OBD header
       this.stopTesterPresentLoop();
-      await this.exec('2F000000', 2000).catch(() => {});
       await this.exec('10 01', 2000).catch(() => {});
       this.udsSessionActive = false;
       await this.exec('ATSH 7DF', 2000).catch(() => {});
       await this.exec('ATCRA', 2000).catch(() => {});
 
       onProgress?.('Sekvenca završena.', 100);
-      this.log('INFO', 'Sekvenca uspešno poslata. Kontrola vraćena računaru (10 01 / ATSH 7DF).');
-      return { success: true, message: 'Komande su uspešno poslate modulu 09 vozila.' };
+
+      if (this.actuatorStats.accepted === 0) {
+        const nrcCode = this.actuatorStats.lastNrc ? `7F 2F ${this.actuatorStats.lastNrc}` : 'bez 6F odgovora';
+        const reason = this.actuatorStats.lastNrcDescription || 'Modul 09 nije prihvatio 2F komande.';
+        const warningMsg = `Modul 09 je odbio komande (${nrcCode}): ${reason}. Nijedna 2F komanda nije vratila pozitivan 6F odgovor — upotrebi Manual 2F DID Tester ispod da pronađeš ispravnu DID adresu za tvoj BCM1.`;
+        this.log('ERROR', warningMsg);
+        return { success: false, message: warningMsg };
+      }
+
+      this.log('INFO', `Sekvenca završena (${this.actuatorStats.accepted} prihvaćenih 6F komandi). Kontrola vraćena računaru (10 01 / ATSH 7DF).`);
+      return {
+        success: true,
+        message: `Modul 09 je prihvatio ${this.actuatorStats.accepted} komandi (pozitivan 6F odgovor).`,
+      };
     } catch (error: any) {
       this.stopTesterPresentLoop();
       this.log('ERROR', `Prekid sekvence: ${error?.message || error}`);
@@ -499,6 +589,123 @@ export class LightShowController {
       throw error;
     } finally {
       this.stopTesterPresentLoop();
+      this.udsSessionActive = false;
+      this.isRunning = false;
+      this.client?.resumePolling?.();
+    }
+  }
+
+  /**
+   * Manual 2F DID Tester for live Audi A8 D4 BCM1 discovery:
+   * 1. Verifies vehicle is stationary (ATSH 7DF -> ATCRA -> 010D == 0 km/h)
+   * 2. Connects to Module 09 (0x70E/0x778, fallback 0x710/0x77A) & opens Extended Session (10 03)
+   * 3. Sends 2F <DID> 03 <STATE> (default 01 = ON), logs 6F vs 7F immediately
+   * 4. Waits 1.5s, sends 2F <DID> 00 (ReturnControlToECU = OFF)
+   * 5. Restores Default Session (10 01) and OBD header (ATSH 7DF / ATCRA)
+   */
+  async testManualDid(
+    didInput: string,
+    controlStateInput = '01'
+  ): Promise<{ accepted: boolean; did: string; nrc?: string; message: string }> {
+    if (this.isRunning) {
+      throw new Error('Sekvenca je već u toku.');
+    }
+    if (!this.client || !this.client.isConnected) {
+      throw new Error('OBD adapter nije povezan. Prvo poveži VLinker BM+ u Settings tabu.');
+    }
+
+    const cleanDid = didInput.replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
+    if (cleanDid.length !== 4) {
+      throw new Error('Unesi tačno 4 hex karaktera za DID (npr. F123 ili 3B10).');
+    }
+
+    const cleanState = controlStateInput.replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
+    if (cleanState.length > 0 && cleanState.length % 2 !== 0) {
+      throw new Error('Control state mora imati paran broj hex cifara (npr. 01 ili 64).');
+    }
+
+    if (typeof this.client.pausePolling === 'function') {
+      this.client.pausePolling();
+    } else {
+      this.client.stopPolling();
+    }
+    await this.waitUntilIdle(2000);
+
+    this.isRunning = true;
+    this.abortRequested = false;
+    this.udsSessionActive = false;
+
+    this.log('INFO', `=== MANUAL 2F DID TEST: 0x${cleanDid} (state: ${cleanState || 'bez bajta'}) ===`);
+
+    try {
+      // 1. Stationary speed check
+      await this.exec('ATSH 7DF', 2000);
+      await this.exec('ATCRA', 2000);
+      const speedRaw = await this.exec('010D', 3000);
+      const parsedSpeed = Elm327Protocol.parsePidValue('0D', speedRaw);
+      const speed = typeof parsedSpeed === 'number' ? parsedSpeed : undefined;
+      if (speed === undefined) {
+        throw new Error('Brzina vozila (PID 010D) nije očitana.');
+      }
+      if (speed > 0) {
+        throw new Error(`VOZILO U POKRETU (${speed} km/h) — test je blokiran dok vozilo ne stane.`);
+      }
+
+      // 2. Connect to Module 09 & open Extended Session (10 03)
+      for (const target of LightShowController.MODULE09_TARGETS) {
+        await this.exec(`ATSH ${target.tx}`, 2000);
+        await this.exec(`ATCRA ${target.rx}`, 2000);
+        const sess = await this.exec('10 03', 3000);
+        const cleanSess = Elm327Protocol.cleanResponse(sess);
+        if (cleanSess.includes('5003') || cleanSess.includes('7F10')) {
+          this.udsSessionActive = true;
+          this.log('INFO', `Modul 09 aktivan na ${target.label} (${cleanSess}).`);
+          break;
+        }
+      }
+      this.udsSessionActive = true;
+
+      // 3. Send 2F <DID> 03 <STATE> (ShortTermAdjustment - ON)
+      const onCmd = `2F${cleanDid}03${cleanState}`;
+      const onResp = await this.exec(onCmd, 2500);
+      const parsed = parseUds2fResponse(onResp);
+
+      if (parsed.accepted) {
+        this.log('INFO', `✅ DID 0x${cleanDid} RADI! Pozitivan odgovor: ${parsed.rawClean}`);
+      } else {
+        const nrcTag = parsed.nrc ? `7F 2F ${parsed.nrc}` : 'ODBIJENO';
+        this.log('ERROR', `❌ DID 0x${cleanDid} NE RADI (${nrcTag}): ${parsed.nrcDescription}`);
+      }
+
+      // 4. Wait 1.5s then send ReturnControlToECU (2F <DID> 00)
+      await this.sleep(1500);
+      await this.exec(`2F${cleanDid}00`, 2000).catch(() => {});
+
+      // 5. Cleanly restore Default Session & OBD-II header
+      await this.exec('10 01', 2000).catch(() => {});
+      this.udsSessionActive = false;
+      await this.exec('ATSH 7DF', 2000).catch(() => {});
+      await this.exec('ATCRA', 2000).catch(() => {});
+
+      if (parsed.accepted) {
+        return {
+          accepted: true,
+          did: cleanDid,
+          message: `✅ DID 0x${cleanDid} RADI! Modul 09 je vratio pozitivan odgovor (${parsed.rawClean}) i kontrola je vraćena posle 1.5s.`,
+        };
+      }
+      const nrcLabel = parsed.nrc ? `7F 2F ${parsed.nrc}` : parsed.rawClean || 'NO DATA';
+      return {
+        accepted: false,
+        did: cleanDid,
+        nrc: parsed.nrc,
+        message: `❌ DID 0x${cleanDid} NE RADI (${nrcLabel}): ${parsed.nrcDescription}`,
+      };
+    } catch (error: any) {
+      this.log('ERROR', `Prekid DID testa: ${error?.message || error}`);
+      await this.emergencyStop();
+      throw error;
+    } finally {
       this.udsSessionActive = false;
       this.isRunning = false;
       this.client?.resumePolling?.();

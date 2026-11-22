@@ -9,6 +9,7 @@ import {
   ActivityIndicator,
   Switch,
   Platform,
+  TextInput,
 } from 'react-native';
 import { useAppStore } from '@/store/app-store';
 import {
@@ -114,6 +115,9 @@ export default function LightShowScreen() {
   const [isExecutingVehicle, setIsExecutingVehicle] = useState(false);
   const [vehicleProgress, setVehicleProgress] = useState<{ step: string; percent: number } | null>(null);
   const [commandLogs, setCommandLogs] = useState<CommandLogEntry[]>([]);
+  const [manualDid, setManualDid] = useState('F123');
+  const [manualState, setManualState] = useState('01');
+  const [isTestingDid, setIsTestingDid] = useState(false);
 
   const controllerRef = useRef<LightShowController | null>(null);
 
@@ -210,7 +214,7 @@ export default function LightShowScreen() {
               const res = await controllerRef.current.runVehicleSequence(selectedEffect, (step, percent) => {
                 setVehicleProgress({ step, percent });
               });
-              Alert.alert('Završeno', res.message);
+              Alert.alert(res.success ? 'Završeno' : 'Upozorenje (UDS 7F)', res.message);
             } catch (err: any) {
               Alert.alert('Prekid sekvence', err?.message || 'Greška tokom slanja komandi vozilu.');
             } finally {
@@ -228,10 +232,52 @@ export default function LightShowScreen() {
       controllerRef.current?.setClient(sharedClient);
       await controllerRef.current?.emergencyStop();
       setIsExecutingVehicle(false);
+      setIsTestingDid(false);
       setVehicleProgress(null);
       Alert.alert('Zaustavljeno', 'TesterPresent je ugašen, sesija vraćena (10 01) i header resetovan na ATSH 7DF.');
     } catch (err: any) {
       Alert.alert('Greška', err?.message || 'Greška pri prinudnom zaustavljanju.');
+    }
+  };
+
+  const handleTestManualDid = async () => {
+    if (!sharedClient.isConnected) {
+      Alert.alert(
+        'OBD adapter nije povezan',
+        'Aktivna Bluetooth sesija sa VLinker BM+ adapterom nije pronađena. Idi u Settings tab i poveži adapter.'
+      );
+      return;
+    }
+    if (hasMovingLock) {
+      Alert.alert(
+        'Bezbednosna blokada',
+        `Vozilo se kreće (${lastObdData?.speed} km/h). Test DID-a je dozvoljen isključivo pri brzini 0 km/h.`
+      );
+      return;
+    }
+    if (!isSafetyUnlocked) {
+      Alert.alert(
+        'Potvrda bezbednosti',
+        'Uključi prekidač "Potvrđujem da vozilo bezbedno miruje" pre testiranja DID adrese.'
+      );
+      return;
+    }
+
+    setIsTestingDid(true);
+    try {
+      if (!controllerRef.current) {
+        controllerRef.current = new LightShowController(sharedClient, entry => {
+          setCommandLogs(prev => [entry, ...prev.slice(0, 59)]);
+        });
+      } else {
+        controllerRef.current.setClient(sharedClient);
+      }
+      const res = await controllerRef.current.testManualDid(manualDid, manualState);
+      Alert.alert(res.accepted ? 'DID RADI (6F)' : 'DID NE RADI (7F)', res.message);
+    } catch (err: any) {
+      Alert.alert('Greška pri testiranju DID-a', err?.message || 'Test nije uspeo.');
+    } finally {
+      setIsTestingDid(false);
     }
   };
 
@@ -498,6 +544,60 @@ export default function LightShowScreen() {
           </TouchableOpacity>
         ))}
 
+        {/* Manual 2F DID Tester (Debug on vehicle) */}
+        {mode === 'vehicle' && (
+          <View style={s.didTesterCard}>
+            <Text style={s.didTesterTitle}>🔧 MANUAL 2F DID TESTER (AUDI A8 D4 DEBUG)</Text>
+            <Text style={s.didTesterSub}>
+              Šalje: 10 03 → 2F &lt;DID&gt; 03 &lt;STATE&gt; → pauza 1.5s → 2F &lt;DID&gt; 00 → 10 01. Odmah proverava 6F (radi) vs 7F (NRC kod).
+            </Text>
+            <View style={s.didInputRow}>
+              <View style={{ flex: 2 }}>
+                <Text style={s.didFieldLabel}>4-CIFRENI HEX DID</Text>
+                <TextInput
+                  style={s.didInput}
+                  value={manualDid}
+                  onChangeText={t => setManualDid(t.replace(/[^0-9a-fA-F]/g, '').toUpperCase().slice(0, 4))}
+                  placeholder="F123"
+                  placeholderTextColor="#6E6266"
+                  autoCapitalize="characters"
+                  autoCorrect={false}
+                  maxLength={4}
+                />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={s.didFieldLabel}>STATE (HEX)</Text>
+                <TextInput
+                  style={s.didInput}
+                  value={manualState}
+                  onChangeText={t => setManualState(t.replace(/[^0-9a-fA-F]/g, '').toUpperCase().slice(0, 4))}
+                  placeholder="01"
+                  placeholderTextColor="#6E6266"
+                  autoCapitalize="characters"
+                  autoCorrect={false}
+                  maxLength={4}
+                />
+              </View>
+            </View>
+            <TouchableOpacity
+              style={[
+                s.didTestButton,
+                (!isConnected || hasMovingLock || !isSafetyUnlocked || isTestingDid || isExecutingVehicle) && s.disabledButton,
+              ]}
+              onPress={handleTestManualDid}
+              disabled={!isConnected || hasMovingLock || !isSafetyUnlocked || isTestingDid || isExecutingVehicle}
+            >
+              {isTestingDid ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={s.didTestButtonText}>
+                  TESTIRAJ DID (2F {manualDid || '____'} 03 {manualState || ''})
+                </Text>
+              )}
+            </TouchableOpacity>
+          </View>
+        )}
+
         <Text style={s.disclaimer}>
           VAŽNO: Ne koristi svetlosne efekte na javnim putevima tokom kretanja vozila. Komande aktuatora su pripremljene za Audi A8 D4 Module 09 (Central Electrics BCM 0x710).
         </Text>
@@ -571,5 +671,25 @@ const s = StyleSheet.create({
   logRow: { flexDirection: 'row', gap: 6, marginBottom: 4 },
   logDirection: { fontSize: 9, fontWeight: '900', fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace' },
   logText: { color: '#E2E8F0', fontSize: 9, flex: 1, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace' },
+  didTesterCard: { marginTop: 18, backgroundColor: '#110D0F', borderColor: '#74481F', borderWidth: 1, borderRadius: 16, padding: 16 },
+  didTesterTitle: { color: '#F59E0B', fontSize: 11, fontWeight: '900', letterSpacing: 1, marginBottom: 6 },
+  didTesterSub: { color: '#C7B9A3', fontSize: 10, lineHeight: 15, marginBottom: 12 },
+  didInputRow: { flexDirection: 'row', gap: 10, marginBottom: 12 },
+  didFieldLabel: { color: '#94868A', fontSize: 8, fontWeight: '800', letterSpacing: 1, marginBottom: 5 },
+  didInput: {
+    backgroundColor: '#050507',
+    borderWidth: 1,
+    borderColor: '#4A1820',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '900',
+    letterSpacing: 2,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  },
+  didTestButton: { backgroundColor: '#B45309', padding: 14, borderRadius: 10, alignItems: 'center' },
+  didTestButtonText: { color: '#fff', fontSize: 10, fontWeight: '900', letterSpacing: 1 },
   disclaimer: { color: '#786D70', fontSize: 10, lineHeight: 17, textAlign: 'center', marginTop: 20 },
 });
