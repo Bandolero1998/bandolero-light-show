@@ -7,222 +7,256 @@ import {
   ScrollView,
   Alert,
   ActivityIndicator,
-  Switch,
   Platform,
-  TextInput,
 } from 'react-native';
 import { useAppStore } from '@/store/app-store';
-import {
-  AVAILABLE_EFFECTS,
-  CommandLogEntry,
-  LightEffectId,
-  LightShowController,
-  Module09ScanResult,
-} from '@/services/light-show-controller';
-import { SafetyInterlock } from '@/services/safety-interlock';
 import { getSharedObdClient } from '@/services/obd-ble';
+import { AudiSpeedometer } from '@/components/audi-speedometer';
+import {
+  A8DiagnosticsService,
+  AirSuspensionReport,
+  ModuleScanEntry,
+  PerformanceRunRecord,
+} from '@/services/a8-diagnostics';
 
-/**
- * Computes which front lamps are lit on a given animation tick (110ms per tick)
- * so police-style headlight patterns flash realistically in crisp headlight white.
- */
-function getHeadlightFrame(effectId: LightEffectId, tick: number, playing: boolean) {
-  if (!playing) {
-    return { leftFog: false, leftMain: false, rightMain: false, rightFog: false, isAmber: false };
-  }
+type CockpitTab = 'speedo' | 'suspension' | 'modules';
+type TimerState = 'idle' | 'armed' | 'running' | 'finished';
 
-  switch (effectId) {
-    case 'police_wigwag': {
-      // 2x Left (ticks 0, 2), pause (4), 2x Right (5, 7), pause (9)
-      const t = tick % 10;
-      const leftMain = t === 0 || t === 2;
-      const rightMain = t === 5 || t === 7;
-      return { leftFog: leftMain, leftMain, rightMain, rightFog: rightMain, isAmber: false };
-    }
-    case 'police_triple': {
-      // 3x rapid Left (0, 2, 4), pause (6), 3x rapid Right (7, 9, 11), pause (13)
-      const t = tick % 14;
-      const leftMain = t === 0 || t === 2 || t === 4;
-      const rightMain = t === 7 || t === 9 || t === 11;
-      return { leftFog: leftMain, leftMain, rightMain, rightFog: rightMain, isAmber: false };
-    }
-    case 'police_sync': {
-      // Both headlights double-flash together (0, 2) then longer dark pause (3..7)
-      const t = tick % 8;
-      const both = t === 0 || t === 2;
-      return { leftFog: both, leftMain: both, rightMain: both, rightFog: both, isAmber: false };
-    }
-    case 'police_pursuit': {
-      // Cross-flash: Left Main + Right Fog (0, 2) -> Right Main + Left Fog (4, 6)
-      const t = tick % 8;
-      const phaseA = t === 0 || t === 2;
-      const phaseB = t === 4 || t === 6;
-      return { leftFog: phaseB, leftMain: phaseA, rightMain: phaseB, rightFog: phaseA, isAmber: false };
-    }
-    case 'police_interceptor': {
-      // Ultra-fast alternating L -> R -> L -> R
-      const t = tick % 4;
-      const left = t === 0;
-      const right = t === 2;
-      return { leftFog: left, leftMain: left, rightMain: right, rightFog: right, isAmber: false };
-    }
-    case 'sweep': {
-      const t = tick % 8;
-      return { leftFog: t < 3, leftMain: t === 1, rightMain: t === 5, rightFog: t >= 4 && t < 7, isAmber: true };
-    }
-    case 'hazard': {
-      const on = Math.floor(tick / 3) % 2 === 0;
-      return { leftFog: on, leftMain: false, rightMain: false, rightFog: on, isAmber: true };
-    }
-    case 'highbeam': {
-      const on = tick % 6 < 3;
-      return { leftFog: on, leftMain: on, rightMain: on, rightFog: on, isAmber: false };
-    }
-    case 'pulse': {
-      const on = tick % 4 === 0 || tick % 4 === 1;
-      return { leftFog: on, leftMain: on, rightMain: on, rightFog: on, isAmber: false };
-    }
-    case 'welcome':
-    default: {
-      const t = tick % 10;
-      return {
-        leftFog: t >= 1 && t <= 7,
-        leftMain: t >= 2 && t <= 8,
-        rightMain: t >= 3 && t <= 8,
-        rightFog: t >= 4 && t <= 7,
-        isAmber: false,
-      };
-    }
-  }
-}
-
-export default function LightShowScreen() {
+export default function A8CockpitScreen() {
   const {
     vehicles,
     activeVehicleId,
     lastObdData,
     connectionStatus,
-    isSafetyUnlocked,
-    setSafetyUnlocked,
+    performanceRuns,
+    addPerformanceRun,
+    clearPerformanceRuns,
   } = useAppStore();
 
   const sharedClient = getSharedObdClient();
-
-  const [mode, setMode] = useState<'simulation' | 'vehicle'>('simulation');
-  const [selectedEffect, setSelectedEffect] = useState<LightEffectId>('police_wigwag');
-  const [isPlayingSimulation, setIsPlayingSimulation] = useState(false);
-  const [animStep, setAnimStep] = useState(0);
-
-  const [isExecutingVehicle, setIsExecutingVehicle] = useState(false);
-  const [vehicleProgress, setVehicleProgress] = useState<{ step: string; percent: number } | null>(null);
-  const [commandLogs, setCommandLogs] = useState<CommandLogEntry[]>([]);
-  const [manualDid, setManualDid] = useState('F123');
-  const [manualState, setManualState] = useState('01');
-  const [isTestingDid, setIsTestingDid] = useState(false);
-  const [isScanningDids, setIsScanningDids] = useState(false);
-  const [scanResult, setScanResult] = useState<Module09ScanResult | null>(null);
-
-  const controllerRef = useRef<LightShowController | null>(null);
-
   const active = vehicles.find(v => v.id === activeVehicleId);
   const isConnected = sharedClient.isConnected || connectionStatus === 'connected';
 
-  // Evaluate safety status from latest cached OBD data (live 010D check also runs inside runVehicleSequence)
-  const safety = SafetyInterlock.evaluate(
-    lastObdData,
-    isConnected,
-    mode === 'simulation'
-  );
+  const [tab, setTab] = useState<CockpitTab>('speedo');
+  const [mirrorHud, setMirrorHud] = useState(false);
 
-  // Allow arming if connected and speed is not actively > 0 (since runVehicleSequence will do live ATSH 7DF -> ATCRA -> 010D check)
-  const hasMovingLock = lastObdData?.speed !== undefined && lastObdData.speed > 0;
-  const canStartVehicleTest = isConnected && !hasMovingLock && isSafetyUnlocked && !isExecutingVehicle;
+  // Demo simulation for testing the classic Audi speedometer & 0-100 timer indoors
+  const [isDemoRunning, setIsDemoRunning] = useState(false);
+  const [demoSpeed, setDemoSpeed] = useState(0);
+  const [demoRpm, setDemoRpm] = useState(720);
 
+  // Performance timer state (0-60, 0-100, 100-200, 402m, Vmax)
+  const [timerState, setTimerState] = useState<TimerState>('idle');
+  const [elapsedSec, setElapsedSec] = useState(0);
+  const [zeroTo60, setZeroTo60] = useState<number | null>(null);
+  const [zeroTo100, setZeroTo100] = useState<number | null>(null);
+  const [hundredTo200, setHundredTo200] = useState<number | null>(null);
+  const [quarterMile, setQuarterMile] = useState<number | null>(null);
+  const [maxSpeed, setMaxSpeed] = useState(0);
+
+  const runStartMsRef = useRef<number | null>(null);
+  const hit100MsRef = useRef<number | null>(null);
+  const lastSampleMsRef = useRef<number | null>(null);
+  const distanceMetersRef = useRef<number>(0);
+
+  // Air Suspension (0x71D) Read-Only Health Check
+  const [isCheckingAir, setIsCheckingAir] = useState(false);
+  const [airReport, setAirReport] = useState<AirSuspensionReport | null>(null);
+
+  // Full 16-Module A8 D4 Scan
+  const [isScanningModules, setIsScanningModules] = useState(false);
+  const [scanProgressText, setScanProgressText] = useState<string | null>(null);
+  const [moduleResults, setModuleResults] = useState<ModuleScanEntry[]>([]);
+
+  const liveSpeed = isDemoRunning ? demoSpeed : (lastObdData?.speed ?? 0);
+  const liveRpm = isDemoRunning ? demoRpm : lastObdData?.rpm;
+  const oilTemp = lastObdData?.oilTemp;
+  const coolantTemp = lastObdData?.coolant;
+  const voltage = lastObdData?.voltage ?? lastObdData?.controlModuleVoltage;
+  const railBar =
+    lastObdData?.fuelRailPressure !== undefined
+      ? Math.round(lastObdData.fuelRailPressure / 100)
+      : undefined;
+
+  // Demo 0-205 km/h acceleration curve (Audi A8 D4 4.2 TDI ~5.5s 0-100)
   useEffect(() => {
-    if (!controllerRef.current) {
-      controllerRef.current = new LightShowController(sharedClient, entry => {
-        setCommandLogs(prev => [entry, ...prev.slice(0, 59)]);
-      });
-    } else {
-      controllerRef.current.setClient(sharedClient);
-    }
-  }, [isConnected, sharedClient]);
+    if (!isDemoRunning) return;
+    const started = Date.now();
+    const id = setInterval(() => {
+      const t = (Date.now() - started) / 1000;
+      if (t >= 18) {
+        setIsDemoRunning(false);
+        setDemoSpeed(0);
+        setDemoRpm(720);
+        return;
+      }
+      // Realistic 4.2 TDI acceleration profile: 0-100 in ~5.5s, 100-200 in ~11.5s
+      const spd = Math.min(205, Math.round(215 * (1 - Math.exp(-t / 8.8))));
+      const gearRpm = 1800 + ((spd * 48) % 2400);
+      setDemoSpeed(spd);
+      setDemoRpm(Math.min(4400, Math.round(gearRpm)));
+    }, 60);
+    return () => clearInterval(id);
+  }, [isDemoRunning]);
 
-  // Fast 110ms Simulation Animation Loop for realistic police strobe timing
+  // Performance timer tracking on every speed update (live OBD or Demo)
   useEffect(() => {
-    let timer: ReturnType<typeof setInterval> | null = null;
-    if (isPlayingSimulation) {
-      timer = setInterval(() => {
-        setAnimStep(prev => (prev + 1) % 120);
-      }, 110);
-    } else {
-      setAnimStep(0);
-    }
-    return () => {
-      if (timer) clearInterval(timer);
-    };
-  }, [isPlayingSimulation]);
+    if (timerState !== 'armed' && timerState !== 'running') return;
+    const now = Date.now();
 
-  const toggleSimulation = () => {
-    setIsPlayingSimulation(!isPlayingSimulation);
+    if (timerState === 'armed') {
+      if (liveSpeed >= 2) {
+        runStartMsRef.current = now;
+        lastSampleMsRef.current = now;
+        distanceMetersRef.current = 0;
+        hit100MsRef.current = null;
+        setTimerState('running');
+        setMaxSpeed(liveSpeed);
+      }
+      return;
+    }
+
+    if (timerState === 'running' && runStartMsRef.current !== null) {
+      const elapsed = (now - runStartMsRef.current) / 1000;
+      setElapsedSec(elapsed);
+
+      if (lastSampleMsRef.current !== null) {
+        const dtSec = (now - lastSampleMsRef.current) / 1000;
+        distanceMetersRef.current += (liveSpeed / 3.6) * dtSec;
+      }
+      lastSampleMsRef.current = now;
+
+      setMaxSpeed(prev => Math.max(prev, liveSpeed));
+
+      if (zeroTo60 === null && liveSpeed >= 60) {
+        setZeroTo60(Number(elapsed.toFixed(2)));
+      }
+      if (zeroTo100 === null && liveSpeed >= 100) {
+        setZeroTo100(Number(elapsed.toFixed(2)));
+        hit100MsRef.current = now;
+      }
+      if (hundredTo200 === null && hit100MsRef.current !== null && liveSpeed >= 200) {
+        setHundredTo200(Number(((now - hit100MsRef.current) / 1000).toFixed(2)));
+      }
+      if (quarterMile === null && distanceMetersRef.current >= 402.3) {
+        setQuarterMile(Number(elapsed.toFixed(2)));
+      }
+    }
+  }, [liveSpeed, timerState, zeroTo60, zeroTo100, hundredTo200, quarterMile]);
+
+  const armTimer = () => {
+    setElapsedSec(0);
+    setZeroTo60(null);
+    setZeroTo100(null);
+    setHundredTo200(null);
+    setQuarterMile(null);
+    setMaxSpeed(0);
+    runStartMsRef.current = null;
+    hit100MsRef.current = null;
+    distanceMetersRef.current = 0;
+    setTimerState('armed');
   };
 
-  const runVehicleTest = async () => {
-    if (mode !== 'vehicle') return;
+  const stopAndSaveRun = () => {
+    setIsDemoRunning(false);
+    setTimerState('finished');
+    if (zeroTo60 !== null || zeroTo100 !== null || maxSpeed >= 40) {
+      const record: PerformanceRunRecord = {
+        id: `run-${Date.now()}`,
+        dateIso: new Date().toLocaleString('sr-RS', {
+          day: '2-digit',
+          month: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
+        zeroTo60Sec: zeroTo60,
+        zeroTo100Sec: zeroTo100,
+        hundredTo200Sec: hundredTo200,
+        quarterMileSec: quarterMile,
+        maxSpeedKmh: Math.round(maxSpeed),
+        oilTempC: oilTemp !== undefined ? Math.round(oilTemp) : undefined,
+      };
+      addPerformanceRun(record);
+    }
+  };
 
-    // 1. Separate, clear connection check BEFORE any PID/safety message
+  const startDemoRun = () => {
+    armTimer();
+    setDemoSpeed(0);
+    setDemoRpm(750);
+    setIsDemoRunning(true);
+  };
+
+  const handleCheckAirSuspension = async () => {
     if (!sharedClient.isConnected) {
       Alert.alert(
         'OBD adapter nije povezan',
-        'Aktivna Bluetooth sesija sa VLinker BM+ adapterom nije pronađena. Idi u Settings tab i poveži adapter.'
+        'Poveži VLinker BM+ u Settings tabu pre provere vazdušnog vešanja.'
       );
       return;
     }
+    setIsCheckingAir(true);
+    try {
+      const svc = new A8DiagnosticsService(sharedClient);
+      const report = await svc.checkAirSuspension();
+      setAirReport(report);
+    } catch (err: any) {
+      Alert.alert('Greška', err?.message || 'Provera vazdušnog vešanja nije uspela.');
+    } finally {
+      setIsCheckingAir(false);
+    }
+  };
 
-    if (hasMovingLock) {
+  const handleScanAllModules = async () => {
+    if (!sharedClient.isConnected) {
       Alert.alert(
-        'Bezbednosna blokada',
-        `Vozilo se kreće (${lastObdData?.speed} km/h). Svetlosni šou je dozvoljen isključivo pri brzini 0 km/h.`
+        'OBD adapter nije povezan',
+        'Poveži VLinker BM+ u Settings tabu pre skeniranja modula.'
       );
       return;
     }
-
-    if (!isSafetyUnlocked) {
-      Alert.alert(
-        'Potvrda bezbednosti',
-        'Uključi prekidač "Potvrđujem da vozilo bezbedno miruje" pre pokretanja komandi.'
-      );
-      return;
+    setIsScanningModules(true);
+    setModuleResults([]);
+    try {
+      const svc = new A8DiagnosticsService(sharedClient);
+      const results = await svc.scanAll16Modules((name, idx, total) => {
+        setScanProgressText(`Skeniram (${idx}/${total}): ${name}...`);
+      });
+      setModuleResults(results);
+    } catch (err: any) {
+      Alert.alert('Greška', err?.message || 'Skeniranje modula nije uspelo.');
+    } finally {
+      setIsScanningModules(false);
+      setScanProgressText(null);
     }
+  };
 
+  const handleClearModuleDtcs = async (entry: ModuleScanEntry) => {
     Alert.alert(
-      'Pokretanje testa na vozilu (Audi A8 D4 Module 09)',
-      `Redosled izvršavanja:\n1. ATSH 7DF + ATCRA + provera 010D (0 km/h)\n2. Prebacivanje na Modul 09 (ATSH 70E/778 ili 710/77A)\n3. UDS Extended Session (10 03) + TesterPresent (3E 80)\n4. Efekat: ${selectedEffect.toUpperCase()}\n\nDa li je kontakt uključen i vozilo u mirovanju?`,
+      `Obriši greške: ${entry.module.name}`,
+      `Da li želiš da pošalješ UDS 14 FF FF FF za brisanje grešaka u modulu ${entry.module.vagAddress} (0x${entry.module.tx})?`,
       [
         { text: 'Otkaži', style: 'cancel' },
         {
-          text: 'Pokreni test',
-          style: 'default',
+          text: 'Obriši',
+          style: 'destructive',
           onPress: async () => {
-            setIsExecutingVehicle(true);
-            setCommandLogs([]);
             try {
-              if (!controllerRef.current) {
-                controllerRef.current = new LightShowController(sharedClient, entry => {
-                  setCommandLogs(prev => [entry, ...prev.slice(0, 59)]);
-                });
-              } else {
-                controllerRef.current.setClient(sharedClient);
+              const svc = new A8DiagnosticsService(sharedClient);
+              const ok = await svc.clearModuleDtcs(entry.module.tx, entry.module.rx);
+              Alert.alert(
+                ok ? 'Obrisano' : 'Nije potvrđeno',
+                ok
+                  ? `Greške u modulu ${entry.module.name} su obrisane.`
+                  : 'Modul nije vratio pozitivan 54 odgovor.'
+              );
+              if (ok) {
+                setModuleResults(prev =>
+                  prev.map(r => (r.module.tx === entry.module.tx ? { ...r, dtcs: [] } : r))
+                );
               }
-              const res = await controllerRef.current.runVehicleSequence(selectedEffect, (step, percent) => {
-                setVehicleProgress({ step, percent });
-              });
-              Alert.alert(res.success ? 'Završeno' : 'Upozorenje (UDS 7F)', res.message);
             } catch (err: any) {
-              Alert.alert('Prekid sekvence', err?.message || 'Greška tokom slanja komandi vozilu.');
-            } finally {
-              setIsExecutingVehicle(false);
-              setVehicleProgress(null);
+              Alert.alert('Greška', err?.message || 'Brisanje grešaka nije uspelo.');
             }
           },
         },
@@ -230,498 +264,400 @@ export default function LightShowScreen() {
     );
   };
 
-  const handlePanicStop = async () => {
-    try {
-      controllerRef.current?.setClient(sharedClient);
-      await controllerRef.current?.emergencyStop();
-      setIsExecutingVehicle(false);
-      setIsTestingDid(false);
-      setIsScanningDids(false);
-      setVehicleProgress(null);
-      Alert.alert('Zaustavljeno', 'TesterPresent je ugašen, sesija vraćena (10 01) i header resetovan na ATSH 7DF.');
-    } catch (err: any) {
-      Alert.alert('Greška', err?.message || 'Greška pri prinudnom zaustavljanju.');
-    }
-  };
-
-  const handleScanModule09 = async () => {
-    if (!sharedClient.isConnected) {
-      Alert.alert(
-        'OBD adapter nije povezan',
-        'Aktivna Bluetooth sesija sa VLinker BM+ adapterom nije pronađena. Idi u Settings tab i poveži adapter.'
-      );
-      return;
-    }
-    if (hasMovingLock) {
-      Alert.alert(
-        'Bezbednosna blokada',
-        `Vozilo se kreće (${lastObdData?.speed} km/h). Skeniranje je dozvoljeno isključivo pri brzini 0 km/h.`
-      );
-      return;
-    }
-    if (!isSafetyUnlocked) {
-      Alert.alert(
-        'Potvrda bezbednosti',
-        'Uključi prekidač "Potvrđujem da vozilo bezbedno miruje" pre skeniranja Modula 09.'
-      );
-      return;
-    }
-
-    setIsScanningDids(true);
-    setScanResult(null);
-    try {
-      if (!controllerRef.current) {
-        controllerRef.current = new LightShowController(sharedClient, entry => {
-          setCommandLogs(prev => [entry, ...prev.slice(0, 59)]);
-        });
-      } else {
-        controllerRef.current.setClient(sharedClient);
-      }
-      const res = await controllerRef.current.scanModule09Dids((step, percent) => {
-        setVehicleProgress({ step, percent });
-      });
-      setScanResult(res);
-      const foundText =
-        res.discoveredDids.length > 0
-          ? `Pronađeno ${res.discoveredDids.length} validnih DID adresa:\n${res.discoveredDids
-              .slice(0, 12)
-              .map(d => `• ${d.did} (${d.status === '6F' ? '6F RADI' : `NRC ${d.nrc}`})`)
-              .join('\n')}`
-          : 'Nijedan DID iz standardnih opsega (3B/54/F4/02) nije odgovorio.';
-      Alert.alert(
-        'Skeniranje Modula 09 završeno',
-        `Modul: ${res.targetLabel}\nPart #: ${res.partNumber || 'Nije očitan'}\nNaziv: ${res.systemName || 'Nije očitan'}\nSesija (10 03): ${res.sessionResponse}\n\n${foundText}`
-      );
-    } catch (err: any) {
-      Alert.alert('Greška pri skeniranju', err?.message || 'Skeniranje Modula 09 nije uspelo.');
-    } finally {
-      setIsScanningDids(false);
-      setVehicleProgress(null);
-    }
-  };
-
-  const handleTestManualDid = async () => {
-    if (!sharedClient.isConnected) {
-      Alert.alert(
-        'OBD adapter nije povezan',
-        'Aktivna Bluetooth sesija sa VLinker BM+ adapterom nije pronađena. Idi u Settings tab i poveži adapter.'
-      );
-      return;
-    }
-    if (hasMovingLock) {
-      Alert.alert(
-        'Bezbednosna blokada',
-        `Vozilo se kreće (${lastObdData?.speed} km/h). Test DID-a je dozvoljen isključivo pri brzini 0 km/h.`
-      );
-      return;
-    }
-    if (!isSafetyUnlocked) {
-      Alert.alert(
-        'Potvrda bezbednosti',
-        'Uključi prekidač "Potvrđujem da vozilo bezbedno miruje" pre testiranja DID adrese.'
-      );
-      return;
-    }
-
-    setIsTestingDid(true);
-    try {
-      if (!controllerRef.current) {
-        controllerRef.current = new LightShowController(sharedClient, entry => {
-          setCommandLogs(prev => [entry, ...prev.slice(0, 59)]);
-        });
-      } else {
-        controllerRef.current.setClient(sharedClient);
-      }
-      const res = await controllerRef.current.testManualDid(manualDid, manualState);
-      Alert.alert(res.accepted ? 'DID RADI (6F)' : 'DID NE RADI (7F)', res.message);
-    } catch (err: any) {
-      Alert.alert('Greška pri testiranju DID-a', err?.message || 'Test nije uspeo.');
-    } finally {
-      setIsTestingDid(false);
-    }
-  };
-
-  const currentEffect = AVAILABLE_EFFECTS.find(e => e.id === selectedEffect);
-  const frame = getHeadlightFrame(selectedEffect, animStep, isPlayingSimulation);
-  const lampColor = frame.isAmber ? '#F59E0B' : '#FFFFFF';
-  const lampGlow = frame.isAmber ? '#F59E0B' : '#E0F2FE';
+  const oilWarm = oilTemp !== undefined && oilTemp >= 80;
 
   return (
     <View style={s.page}>
       <ScrollView contentContainerStyle={s.content} showsVerticalScrollIndicator={false}>
         <Text style={s.brand}>BANDOLERO</Text>
-        <Text style={s.title}>LIGHT SHOW</Text>
-        <Text style={s.sub}>POLICE STROBE & AUDI A8 D4 UDS CONTROL</Text>
+        <Text style={s.title}>A8 D4 COCKPIT</Text>
+        <Text style={s.sub}>
+          {active ? `${active.make.toUpperCase()} ${active.model.toUpperCase()} ${active.engine}` : 'AUDI A8 D4 4.2 TDI'} ·{' '}
+          {isConnected ? 'VLINKER ONLINE' : 'OFFLINE'}
+        </Text>
 
-        {/* Mode Selector Tabs */}
-        <View style={s.modeSelector}>
+        {/* Top 3-Tab Switcher */}
+        <View style={s.tabBar}>
           <TouchableOpacity
-            style={[s.modeTab, mode === 'simulation' && s.activeModeTab]}
-            onPress={() => setMode('simulation')}
+            style={[s.tabBtn, tab === 'speedo' && s.tabBtnActive]}
+            onPress={() => setTab('speedo')}
           >
-            <Text style={[s.modeTabText, mode === 'simulation' && s.activeModeTabText]}>
-              📱 SIMULACIJA
-            </Text>
+            <Text style={[s.tabText, tab === 'speedo' && s.tabTextActive]}>BRZINOMER</Text>
           </TouchableOpacity>
           <TouchableOpacity
-            style={[s.modeTab, mode === 'vehicle' && s.activeModeTab]}
-            onPress={() => setMode('vehicle')}
+            style={[s.tabBtn, tab === 'suspension' && s.tabBtnActive]}
+            onPress={() => setTab('suspension')}
           >
-            <Text style={[s.modeTabText, mode === 'vehicle' && s.activeModeTabText]}>
-              🚗 TEST NA VOZILU
-            </Text>
+            <Text style={[s.tabText, tab === 'suspension' && s.tabTextActive]}>VEŠANJE</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[s.tabBtn, tab === 'modules' && s.tabBtnActive]}
+            onPress={() => setTab('modules')}
+          >
+            <Text style={[s.tabText, tab === 'modules' && s.tabTextActive]}>16 MODULA</Text>
           </TouchableOpacity>
         </View>
 
-        {/* Selected Vehicle Card */}
-        <View style={s.vehicle}>
-          <Text style={s.miniLabel}>AKTIVNO VOZILO</Text>
-          <Text style={s.vehicleName}>{active ? `${active.make} ${active.model}` : 'Nije izabrano vozilo'}</Text>
-          <Text style={s.vehicleMeta}>
-            {active ? `${active.year} · ${active.engine} · UDS CAN 0x710` : 'Dodaj vozilo u garaži'}
-          </Text>
-        </View>
+        {/* ==================== TAB 1: CLASSIC AUDI A8 SPEEDOMETER & 0-100 ==================== */}
+        {tab === 'speedo' && (
+          <View>
+            <View style={s.speedoCard}>
+              <View style={s.speedoHeaderRow}>
+                <View style={s.warmPill}>
+                  <View
+                    style={[
+                      s.warmDot,
+                      {
+                        backgroundColor:
+                          oilTemp === undefined ? '#71717A' : oilWarm ? '#10B981' : '#38BDF8',
+                      },
+                    ]}
+                  />
+                  <Text style={s.warmText}>
+                    {oilTemp === undefined
+                      ? 'ULJE: --°C'
+                      : oilWarm
+                      ? `ULJE ${Math.round(oilTemp)}°C · READY`
+                      : `ULJE ${Math.round(oilTemp)}°C · ZAGREVA SE`}
+                  </Text>
+                </View>
 
-        {/* Mode Specific Notices */}
-        {mode === 'simulation' ? (
-          <View style={s.simNotice}>
-            <Text style={s.simNoticeTitle}>ℹ️ REŽIM EKRANSKE SIMULACIJE</Text>
-            <Text style={s.simNoticeText}>
-              Pretpregled policijskog blicanja u beloj boji farova i standardnih efekata direktno na ekranu. U ovom režimu komande se NE šalju vozilu.
-            </Text>
-          </View>
-        ) : (
-          <View style={[s.warning, !isConnected && { borderColor: '#DC2626' }]}>
-            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 6 }}>
-              <Text style={{ fontSize: 14 }}>⚠️</Text>
-              <Text style={s.warningTitle}>ZAHTEVA FIZIČKO TESTIRANJE NA VOZILU</Text>
-            </View>
-            <Text style={s.warningText}>
-              Koristi deljenu VLinker BM+ sesiju: prvo resetuje header (ATSH 7DF / ATCRA) i proverava brzinu (010D), pa otvara Modul 09 (0x710, 10 03 + TesterPresent 3E 80).
-            </Text>
-            <View style={s.rule} />
-            <Text style={s.safetyHeadline}>STATUS KONEKCIJE I BEZBEDNOSTI:</Text>
-            <Text style={[s.safetyItem, { color: isConnected ? '#34D399' : '#FCA5A5', fontWeight: '800' }]}>
-              • {isConnected ? 'OBD adapter je povezan (deljena BLE sesija aktivna)' : 'OBD adapter NIJE povezan — poveži ga u Settings tabu'}
-            </Text>
-            {isConnected && safety.reasons.map((r, i) => (
-              <Text key={i} style={s.safetyItem}>• {r}</Text>
-            ))}
-            {hasMovingLock && (
-              <View style={s.lockBanner}>
-                <Text style={s.lockBannerText}>🔒 BLOKIRANO: Vozilo se kreće ({lastObdData?.speed} km/h)</Text>
+                <TouchableOpacity
+                  style={[s.hudBtn, mirrorHud && s.hudBtnActive]}
+                  onPress={() => setMirrorHud(!mirrorHud)}
+                >
+                  <Text style={[s.hudBtnText, mirrorHud && { color: '#fff' }]}>
+                    {mirrorHud ? 'HUD ON' : 'HUD OGLEDALO'}
+                  </Text>
+                </TouchableOpacity>
               </View>
-            )}
-          </View>
-        )}
 
-        {/* Visual Light Box Simulation (placed above library for easy viewing!) */}
-        <View style={s.previewBox}>
-          <Text style={s.previewTitle}>
-            {isPlayingSimulation ? `▶ ${currentEffect?.name}` : 'PRETPREGLED FAROVA (BOJA FARA)'}
-          </Text>
-
-          <View style={s.carGraphicBox}>
-            <View style={s.headlightRow}>
-              {/* Left Fog / DRL */}
-              <View
-                style={[
-                  s.carLamp,
-                  frame.leftFog && {
-                    backgroundColor: lampColor,
-                    shadowColor: lampGlow,
-                    shadowOpacity: 1,
-                    shadowRadius: 14,
-                    elevation: 10,
-                  },
-                ]}
-              />
-              {/* Left Main Headlight */}
-              <View
-                style={[
-                  s.carLampLarge,
-                  frame.leftMain && {
-                    backgroundColor: lampColor,
-                    shadowColor: lampGlow,
-                    shadowOpacity: 1,
-                    shadowRadius: 18,
-                    elevation: 14,
-                  },
-                ]}
-              />
-              {/* Center Grille / Badge */}
-              <View style={s.carGrille}>
-                <Text style={{ fontSize: 18 }}>🚘</Text>
+              <View style={s.speedoCenter}>
+                <AudiSpeedometer
+                  speedKmh={liveSpeed}
+                  rpm={liveRpm}
+                  maxSpeed={280}
+                  mirrorHud={mirrorHud}
+                  size={274}
+                />
               </View>
-              {/* Right Main Headlight */}
-              <View
-                style={[
-                  s.carLampLarge,
-                  frame.rightMain && {
-                    backgroundColor: lampColor,
-                    shadowColor: lampGlow,
-                    shadowOpacity: 1,
-                    shadowRadius: 18,
-                    elevation: 14,
-                  },
-                ]}
-              />
-              {/* Right Fog / DRL */}
-              <View
-                style={[
-                  s.carLamp,
-                  frame.rightFog && {
-                    backgroundColor: lampColor,
-                    shadowColor: lampGlow,
-                    shadowOpacity: 1,
-                    shadowRadius: 14,
-                    elevation: 10,
-                  },
-                ]}
-              />
-            </View>
-          </View>
 
-          {mode === 'simulation' ? (
-            <TouchableOpacity style={s.previewButton} onPress={toggleSimulation}>
-              <Text style={s.previewButtonText}>
-                {isPlayingSimulation ? '⏹ ZAUSTAVI PREGLED' : '▶ POKRENI EKRANSKI PREGLED'}
-              </Text>
-            </TouchableOpacity>
-          ) : (
-            <Text style={s.previewNote}>Audi A8 D4 4.2 TDI · UDS Module 09 (0x710) + TesterPresent 3E 80</Text>
-          )}
-        </View>
-
-        {/* Vehicle Test Arming & Execution Controls */}
-        {mode === 'vehicle' && (
-          <View style={s.vehicleControlPanel}>
-            <View style={s.switchRow}>
-              <View style={{ flex: 1, paddingRight: 10 }}>
-                <Text style={s.switchLabel}>Potvrđujem da vozilo bezbedno miruje</Text>
-                <Text style={s.switchHint}>Brzina mora biti 0 km/h, menjač u P/N sa uključenim kontaktom.</Text>
-              </View>
-              <Switch
-                value={isSafetyUnlocked}
-                onValueChange={setSafetyUnlocked}
-                trackColor={{ false: '#3A1A20', true: '#DC2626' }}
-                thumbColor={isSafetyUnlocked ? '#FEE2E2' : '#8E868A'}
-              />
-            </View>
-
-            {vehicleProgress && (
-              <View style={s.progressBox}>
-                <ActivityIndicator color="#EF4444" />
-                <View style={{ flex: 1 }}>
-                  <Text style={s.progressText}>{vehicleProgress.step}</Text>
-                  <Text style={s.progressPercent}>{vehicleProgress.percent}%</Text>
+              {/* Live 4.2 TDI Telemetry Strip */}
+              <View style={s.telemetryRow}>
+                <View style={s.teleCell}>
+                  <Text style={s.teleLabel}>VODA</Text>
+                  <Text style={s.teleVal}>
+                    {coolantTemp !== undefined ? `${Math.round(coolantTemp)}°C` : '--'}
+                  </Text>
+                </View>
+                <View style={s.teleCell}>
+                  <Text style={s.teleLabel}>ULJE</Text>
+                  <Text style={s.teleVal}>
+                    {oilTemp !== undefined ? `${Math.round(oilTemp)}°C` : '--'}
+                  </Text>
+                </View>
+                <View style={s.teleCell}>
+                  <Text style={s.teleLabel}>RAIL</Text>
+                  <Text style={s.teleVal}>{railBar !== undefined ? `${railBar} bar` : '--'}</Text>
+                </View>
+                <View style={s.teleCell}>
+                  <Text style={s.teleLabel}>NAPON</Text>
+                  <Text style={s.teleVal}>
+                    {voltage !== undefined ? `${voltage.toFixed(1)}V` : '--'}
+                  </Text>
                 </View>
               </View>
-            )}
-
-            <View style={{ flexDirection: 'row', gap: 10, marginTop: 14 }}>
-              <TouchableOpacity
-                style={[
-                  s.primaryButton,
-                  { flex: 1 },
-                  !canStartVehicleTest && s.disabledButton,
-                ]}
-                onPress={runVehicleTest}
-                disabled={!canStartVehicleTest}
-              >
-                {isExecutingVehicle ? (
-                  <ActivityIndicator color="#fff" />
-                ) : (
-                  <Text style={s.primaryButtonText}>POKRENI TEST NA VOZILU</Text>
-                )}
-              </TouchableOpacity>
-
-              <TouchableOpacity style={s.panicButton} onPress={handlePanicStop}>
-                <Text style={s.panicButtonText}>🚨 PANIC STOP</Text>
-              </TouchableOpacity>
             </View>
 
-            {/* Live Command Console Output */}
-            <Text style={s.consoleTitle}>KOMANDNI ODZIV VOZILA (TX / RX LOG):</Text>
-            <ScrollView
-              style={s.consoleBox}
-              contentContainerStyle={s.consoleContent}
-              nestedScrollEnabled
-              showsVerticalScrollIndicator
-            >
-              {commandLogs.length === 0 ? (
-                <Text style={s.consoleEmpty}>Nema zabeleženih komandi. Pokreni test da vidiš UDS razmenu sa vozilom.</Text>
-              ) : (
-                commandLogs.map((log, idx) => (
-                  <View key={idx} style={s.logRow}>
-                    <Text
-                      style={[
-                        s.logDirection,
-                        log.direction === 'TX'
-                          ? { color: '#60A5FA' }
-                          : log.direction === 'RX'
-                          ? { color: '#34D399' }
-                          : log.direction === 'ERROR'
-                          ? { color: '#F87171' }
-                          : { color: '#FBBF24' },
-                      ]}
-                    >
-                      [{log.direction}]
+            {/* 0-100 / 100-200 / 402m Performance Timer */}
+            <View style={s.perfCard}>
+              <View style={s.perfHeader}>
+                <Text style={s.perfTitle}>⏱ 0–100 / 100–200 / 402m TAJMER</Text>
+                <Text style={s.perfBadge}>
+                  {timerState === 'armed'
+                    ? 'ČEKA START...'
+                    : timerState === 'running'
+                    ? `${elapsedSec.toFixed(2)} s`
+                    : timerState === 'finished'
+                    ? 'ZAVRŠENO'
+                    : 'SPREMAN'}
+                </Text>
+              </View>
+
+              <View style={s.splitGrid}>
+                <View style={s.splitBox}>
+                  <Text style={s.splitLabel}>0 – 60 km/h</Text>
+                  <Text style={s.splitVal}>
+                    {zeroTo60 !== null ? `${zeroTo60.toFixed(2)} s` : '--.-- s'}
+                  </Text>
+                </View>
+                <View style={[s.splitBox, s.splitBoxHighlight]}>
+                  <Text style={[s.splitLabel, { color: '#FCA5A5' }]}>0 – 100 km/h</Text>
+                  <Text style={[s.splitVal, { color: '#fff', fontSize: 22 }]}>
+                    {zeroTo100 !== null ? `${zeroTo100.toFixed(2)} s` : '--.-- s'}
+                  </Text>
+                </View>
+                <View style={s.splitBox}>
+                  <Text style={s.splitLabel}>100 – 200 km/h</Text>
+                  <Text style={s.splitVal}>
+                    {hundredTo200 !== null ? `${hundredTo200.toFixed(2)} s` : '--.-- s'}
+                  </Text>
+                </View>
+                <View style={s.splitBox}>
+                  <Text style={s.splitLabel}>402m · Vmax</Text>
+                  <Text style={s.splitVal}>
+                    {quarterMile !== null ? `${quarterMile.toFixed(2)}s` : `${Math.round(maxSpeed)} km/h`}
+                  </Text>
+                </View>
+              </View>
+
+              <View style={s.actionRow}>
+                {timerState === 'running' || timerState === 'armed' ? (
+                  <TouchableOpacity style={[s.primaryBtn, { flex: 1 }]} onPress={stopAndSaveRun}>
+                    <Text style={s.primaryBtnText}>⏹ ZAUSTAVI & SAČUVAJ</Text>
+                  </TouchableOpacity>
+                ) : (
+                  <TouchableOpacity style={[s.primaryBtn, { flex: 1 }]} onPress={armTimer}>
+                    <Text style={s.primaryBtnText}>▶ PRIPREMI START (0–100)</Text>
+                  </TouchableOpacity>
+                )}
+
+                <TouchableOpacity
+                  style={s.secondaryBtn}
+                  onPress={isDemoRunning ? stopAndSaveRun : startDemoRun}
+                >
+                  <Text style={s.secondaryBtnText}>
+                    {isDemoRunning ? 'STOP DEMO' : 'DEMO 0–200'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* Saved Best Runs */}
+            {performanceRuns.length > 0 && (
+              <View style={s.historyCard}>
+                <View style={s.perfHeader}>
+                  <Text style={s.perfTitle}>🏆 SAČUVANA MERENJA ({performanceRuns.length})</Text>
+                  <TouchableOpacity onPress={clearPerformanceRuns}>
+                    <Text style={s.clearLink}>Obriši</Text>
+                  </TouchableOpacity>
+                </View>
+                {performanceRuns.slice(0, 6).map(r => (
+                  <View key={r.id} style={s.historyRow}>
+                    <Text style={s.historyDate}>{r.dateIso}</Text>
+                    <Text style={s.historyMetric}>
+                      0–100: <Text style={{ color: '#fff', fontWeight: '900' }}>{r.zeroTo100Sec !== null ? `${r.zeroTo100Sec.toFixed(2)}s` : '--'}</Text>
                     </Text>
-                    <Text style={s.logText}>{log.text}</Text>
+                    <Text style={s.historyMetric}>
+                      100–200: {r.hundredTo200Sec !== null ? `${r.hundredTo200Sec.toFixed(2)}s` : '--'}
+                    </Text>
+                    <Text style={s.historyMetric}>Max {r.maxSpeedKmh}</Text>
                   </View>
-                ))
-              )}
-            </ScrollView>
+                ))}
+              </View>
+            )}
           </View>
         )}
 
-        {/* Effect Library */}
-        <Text style={s.section}>POLICE STROBE & LIGHT MODOVI ({AVAILABLE_EFFECTS.length})</Text>
-        {AVAILABLE_EFFECTS.map(e => (
-          <TouchableOpacity
-            key={e.id}
-            style={[s.effect, selectedEffect === e.id && s.selected]}
-            onPress={() => setSelectedEffect(e.id)}
-          >
-            <Text style={s.number}>{e.index}</Text>
-            <View style={{ flex: 1 }}>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                <Text style={s.effectName}>{e.name}</Text>
-                {e.category === 'POLICE HEADLIGHT' && (
-                  <View style={s.policeTag}>
-                    <Text style={s.policeTagText}>STROBE</Text>
+        {/* ==================== TAB 2: AIR SUSPENSION (0x71D) READ-ONLY CHECK ==================== */}
+        {tab === 'suspension' && (
+          <View style={s.card}>
+            <Text style={s.cardTitle}>🛞 VAZDUŠNO VEŠANJE — PROVERA JASTUKA (0x71D)</Text>
+            <Text style={s.cardSub}>
+              100% bezbedno čitanje (Read-Only) iz Modula 34 (Level Control). Proverava ispravnost sva 4 jastuka, ventila, kompresora i očitava visinu bez ikakvog rizika po kompresor ili kalibraciju.
+            </Text>
+
+            {/* 4-Corner Visual Car Air Bag Status */}
+            <View style={s.airDiagram}>
+              <View style={s.airRow}>
+                <View
+                  style={[
+                    s.bagBox,
+                    airReport?.allBagsHealthy && s.bagBoxOk,
+                    airReport && !airReport.allBagsHealthy && airReport.reachable && s.bagBoxWarn,
+                  ]}
+                >
+                  <Text style={s.bagCorner}>PREDNJI LEVI (FL)</Text>
+                  <Text style={s.bagStatus}>
+                    {!airReport
+                      ? 'ČEKA PROVERU'
+                      : airReport.heightsMm.fl !== null
+                      ? `${airReport.heightsMm.fl} mm`
+                      : airReport.allBagsHealthy
+                      ? 'JASTUK OK ✓'
+                      : 'PROVERI DTC'}
+                  </Text>
+                </View>
+                <View
+                  style={[
+                    s.bagBox,
+                    airReport?.allBagsHealthy && s.bagBoxOk,
+                    airReport && !airReport.allBagsHealthy && airReport.reachable && s.bagBoxWarn,
+                  ]}
+                >
+                  <Text style={s.bagCorner}>PREDNJI DESNI (FR)</Text>
+                  <Text style={s.bagStatus}>
+                    {!airReport
+                      ? 'ČEKA PROVERU'
+                      : airReport.heightsMm.fr !== null
+                      ? `${airReport.heightsMm.fr} mm`
+                      : airReport.allBagsHealthy
+                      ? 'JASTUK OK ✓'
+                      : 'PROVERI DTC'}
+                  </Text>
+                </View>
+              </View>
+
+              <Text style={s.carCenterIcon}>🚘</Text>
+
+              <View style={s.airRow}>
+                <View
+                  style={[
+                    s.bagBox,
+                    airReport?.allBagsHealthy && s.bagBoxOk,
+                    airReport && !airReport.allBagsHealthy && airReport.reachable && s.bagBoxWarn,
+                  ]}
+                >
+                  <Text style={s.bagCorner}>ZADNJI LEVI (RL)</Text>
+                  <Text style={s.bagStatus}>
+                    {!airReport
+                      ? 'ČEKA PROVERU'
+                      : airReport.heightsMm.rl !== null
+                      ? `${airReport.heightsMm.rl} mm`
+                      : airReport.allBagsHealthy
+                      ? 'JASTUK OK ✓'
+                      : 'PROVERI DTC'}
+                  </Text>
+                </View>
+                <View
+                  style={[
+                    s.bagBox,
+                    airReport?.allBagsHealthy && s.bagBoxOk,
+                    airReport && !airReport.allBagsHealthy && airReport.reachable && s.bagBoxWarn,
+                  ]}
+                >
+                  <Text style={s.bagCorner}>ZADNJI DESNI (RR)</Text>
+                  <Text style={s.bagStatus}>
+                    {!airReport
+                      ? 'ČEKA PROVERU'
+                      : airReport.heightsMm.rr !== null
+                      ? `${airReport.heightsMm.rr} mm`
+                      : airReport.allBagsHealthy
+                      ? 'JASTUK OK ✓'
+                      : 'PROVERI DTC'}
+                  </Text>
+                </View>
+              </View>
+            </View>
+
+            <TouchableOpacity
+              style={[s.primaryBtn, (!isConnected || isCheckingAir) && s.disabledBtn]}
+              onPress={handleCheckAirSuspension}
+              disabled={!isConnected || isCheckingAir}
+            >
+              {isCheckingAir ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={s.primaryBtnText}>🔍 PROVERI JASTUKE I VISINU (0x71D)</Text>
+              )}
+            </TouchableOpacity>
+
+            {airReport && (
+              <View
+                style={[
+                  s.reportBox,
+                  airReport.allBagsHealthy ? s.reportBoxOk : s.reportBoxErr,
+                ]}
+              >
+                <Text style={s.reportTitle}>
+                  {airReport.allBagsHealthy
+                    ? '✅ SVI JASTUCI I KOMPRESOR SU DOBRI'
+                    : '⚠️ PROVERI STANJE VEŠANJA'}
+                </Text>
+                <Text style={s.reportText}>{airReport.summary}</Text>
+                {airReport.partNumber && (
+                  <Text style={s.reportMeta}>
+                    Modul 34: {airReport.partNumber} {airReport.systemName ? `(${airReport.systemName})` : ''}
+                  </Text>
+                )}
+                {airReport.dtcs.length > 0 && (
+                  <View style={{ marginTop: 8 }}>
+                    {airReport.dtcs.map((d, i) => (
+                      <Text key={i} style={s.dtcLine}>
+                        • UDS DTC 0x{d.codeHex} (status 0x{d.statusByte}) {d.isActive ? '— AKTIVNA' : '— memorisana'}
+                      </Text>
+                    ))}
                   </View>
                 )}
               </View>
-              <Text style={s.effectSub}>{e.description}</Text>
-            </View>
-            <View style={[s.badgeBox, selectedEffect === e.id && { backgroundColor: '#DC2626' }]}>
-              <Text style={[s.preview, selectedEffect === e.id && { color: '#fff' }]}>
-                {selectedEffect === e.id ? 'IZABRANO' : 'IZABERI'}
-              </Text>
-            </View>
-          </TouchableOpacity>
-        ))}
+            )}
+          </View>
+        )}
 
-        {/* Manual 2F DID Tester & Auto Scanner (Debug on vehicle) */}
-        {mode === 'vehicle' && (
-          <View style={s.didTesterCard}>
-            <Text style={s.didTesterTitle}>🔧 MODUL 09 SKENER & MANUAL 2F DID TESTER</Text>
-            <Text style={s.didTesterSub}>
-              1) Očitaj kataloški broj Modula 09 (22 F1 87) i automatski pronađi validne 2F DID adrese.{'\n'}
-              2) Klikni na pronađeni DID ili ga unesi ručno za test: 10 03 → 2F &lt;DID&gt; 03 &lt;STATE&gt; → 1.5s → 2F &lt;DID&gt; 00.
+        {/* ==================== TAB 3: FULL 16-MODULE A8 D4 DOCTOR ==================== */}
+        {tab === 'modules' && (
+          <View style={s.card}>
+            <Text style={s.cardTitle}>🩺 AUDI A8 D4 — 16-MODULE AUTO-SCAN</Text>
+            <Text style={s.cardSub}>
+              Skenira greške (UDS 19 02) na svih 16 modula potvrđenih na tvom Audi A8 D4: Vazdušno vešanje, ABS, Menjač, Tabla, Airbag, Ručna, Klima, Park senzori, Gateway, Sedišta i Pojasevi.
             </Text>
 
             <TouchableOpacity
-              style={[
-                s.scanButton,
-                (!isConnected || hasMovingLock || !isSafetyUnlocked || isScanningDids || isTestingDid || isExecutingVehicle) &&
-                  s.disabledButton,
-              ]}
-              onPress={handleScanModule09}
-              disabled={!isConnected || hasMovingLock || !isSafetyUnlocked || isScanningDids || isTestingDid || isExecutingVehicle}
+              style={[s.primaryBtn, (!isConnected || isScanningModules) && s.disabledBtn]}
+              onPress={handleScanAllModules}
+              disabled={!isConnected || isScanningModules}
             >
-              {isScanningDids ? (
+              {isScanningModules ? (
                 <ActivityIndicator color="#fff" />
               ) : (
-                <Text style={s.scanButtonText}>🔍 OČITAJ MODUL 09 (PART #) + PRONAĐI DID-OVE</Text>
+                <Text style={s.primaryBtnText}>🔍 SKENIRAJ SVIH 16 MODULA</Text>
               )}
             </TouchableOpacity>
 
-            {scanResult && (
-              <View style={s.scanResultBox}>
-                <Text style={s.scanResultHeader}>REZULTAT SKENIRANJA ({scanResult.targetLabel}):</Text>
-                <Text style={s.scanResultMeta}>
-                  Part #: {scanResult.partNumber || 'N/A'} · Naziv: {scanResult.systemName || 'N/A'}
-                </Text>
-                <Text style={s.scanResultMeta}>
-                  10 03: {scanResult.sessionResponse} · Skenirano: {scanResult.scannedCount}
-                </Text>
-                {scanResult.longCodingHex && (
-                  <Text style={[s.scanResultMeta, { color: '#34D399' }]}>
-                    Long Coding: {scanResult.longCodingHex}
-                  </Text>
-                )}
-                {scanResult.allFoundModules && scanResult.allFoundModules.length > 0 && (
-                  <Text style={[s.scanResultMeta, { color: '#93C5FD', marginTop: 4 }]}>
-                    Svi moduli ({scanResult.allFoundModules.length}):{'\n'}
-                    {scanResult.allFoundModules.join('\n')}
-                  </Text>
-                )}
-                {scanResult.discoveredDids.length > 0 ? (
-                  <View style={s.didChipWrap}>
-                    {scanResult.discoveredDids.map(item => (
-                      <TouchableOpacity
-                        key={item.did}
-                        style={[s.didChip, item.status === '6F' && s.didChipAccepted]}
-                        onPress={() => setManualDid(item.did)}
-                      >
-                        <Text style={s.didChipText}>
-                          {item.did} ({item.status === '6F' ? '6F' : `NRC ${item.nrc}`})
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
-                  </View>
-                ) : (
-                  <Text style={s.scanResultEmpty}>
-                    Nijedan DID iz opsega 3B/54/F4/02 nije odgovorio (pošalji screenshot ovog rezultata).
-                  </Text>
-                )}
-              </View>
+            {scanProgressText && (
+              <Text style={s.progressNote}>{scanProgressText}</Text>
             )}
 
-            <View style={s.didInputRow}>
-              <View style={{ flex: 2 }}>
-                <Text style={s.didFieldLabel}>4-CIFRENI HEX DID</Text>
-                <TextInput
-                  style={s.didInput}
-                  value={manualDid}
-                  onChangeText={t => setManualDid(t.replace(/[^0-9a-fA-F]/g, '').toUpperCase().slice(0, 4))}
-                  placeholder="F123"
-                  placeholderTextColor="#6E6266"
-                  autoCapitalize="characters"
-                  autoCorrect={false}
-                  maxLength={4}
-                />
+            {moduleResults.length > 0 && (
+              <View style={{ marginTop: 14, gap: 8 }}>
+                {moduleResults.map(entry => {
+                  const hasFaults = entry.dtcs.length > 0;
+                  return (
+                    <View
+                      key={entry.module.tx}
+                      style={[
+                        s.modRow,
+                        hasFaults ? s.modRowFault : entry.reachable ? s.modRowOk : s.modRowOff,
+                      ]}
+                    >
+                      <View style={{ flex: 1 }}>
+                        <Text style={s.modName}>
+                          [{entry.module.vagAddress}] {entry.module.name}
+                        </Text>
+                        <Text style={s.modMeta}>
+                          0x{entry.module.tx}/0x{entry.module.rx} ·{' '}
+                          {!entry.reachable
+                            ? 'Nije odgovorio'
+                            : hasFaults
+                            ? `${entry.dtcs.length} grešaka (${entry.dtcs.map(d => d.codeHex).slice(0, 3).join(', ')})`
+                            : '0 grešaka — OK ✓'}
+                        </Text>
+                      </View>
+                      {hasFaults && (
+                        <TouchableOpacity
+                          style={s.clearModBtn}
+                          onPress={() => handleClearModuleDtcs(entry)}
+                        >
+                          <Text style={s.clearModText}>OBRIŠI</Text>
+                        </TouchableOpacity>
+                      )}
+                    </View>
+                  );
+                })}
               </View>
-              <View style={{ flex: 1 }}>
-                <Text style={s.didFieldLabel}>STATE (HEX)</Text>
-                <TextInput
-                  style={s.didInput}
-                  value={manualState}
-                  onChangeText={t => setManualState(t.replace(/[^0-9a-fA-F]/g, '').toUpperCase().slice(0, 4))}
-                  placeholder="01"
-                  placeholderTextColor="#6E6266"
-                  autoCapitalize="characters"
-                  autoCorrect={false}
-                  maxLength={4}
-                />
-              </View>
-            </View>
-            <TouchableOpacity
-              style={[
-                s.didTestButton,
-                (!isConnected || hasMovingLock || !isSafetyUnlocked || isTestingDid || isScanningDids || isExecutingVehicle) &&
-                  s.disabledButton,
-              ]}
-              onPress={handleTestManualDid}
-              disabled={!isConnected || hasMovingLock || !isSafetyUnlocked || isTestingDid || isScanningDids || isExecutingVehicle}
-            >
-              {isTestingDid ? (
-                <ActivityIndicator color="#fff" />
-              ) : (
-                <Text style={s.didTestButtonText}>
-                  TESTIRAJ DID (2F {manualDid || '____'} 03 {manualState || ''})
-                </Text>
-              )}
-            </TouchableOpacity>
+            )}
           </View>
         )}
-
-        <Text style={s.disclaimer}>
-          VAŽNO: Ne koristi svetlosne efekte na javnim putevima tokom kretanja vozila. Komande aktuatora su pripremljene za Audi A8 D4 Module 09 (Central Electrics BCM 0x710).
-        </Text>
       </ScrollView>
     </View>
   );
@@ -729,105 +665,225 @@ export default function LightShowScreen() {
 
 const s = StyleSheet.create({
   page: { flex: 1, backgroundColor: '#050507' },
-  content: { padding: 24, paddingTop: 74, paddingBottom: 150 },
-  brand: { color: '#EF4444', fontSize: 12, fontWeight: '900', letterSpacing: 5 },
-  title: { color: '#fff', fontSize: 30, fontWeight: '900', marginTop: 12 },
-  sub: { color: '#8E868A', fontSize: 10, letterSpacing: 2.5, marginTop: 5, marginBottom: 20 },
-  modeSelector: { flexDirection: 'row', backgroundColor: '#110D0F', borderRadius: 12, padding: 4, marginBottom: 16, borderWidth: 1, borderColor: '#2E161A' },
-  modeTab: { flex: 1, paddingVertical: 11, alignItems: 'center', borderRadius: 9 },
-  activeModeTab: { backgroundColor: '#DC2626' },
-  modeTabText: { color: '#94868A', fontSize: 10, fontWeight: '800', letterSpacing: 0.5 },
-  activeModeTabText: { color: '#fff' },
-  vehicle: { backgroundColor: '#110D0F', borderColor: '#3A151B', borderWidth: 1, borderRadius: 14, padding: 15, marginBottom: 14 },
-  miniLabel: { color: '#EF4444', fontSize: 9, fontWeight: '900', letterSpacing: 1.5 },
-  vehicleName: { color: '#fff', fontSize: 17, fontWeight: '800', marginTop: 6 },
-  vehicleMeta: { color: '#94868A', fontSize: 10, marginTop: 3 },
-  simNotice: { backgroundColor: '#140F11', borderColor: '#4A1820', borderWidth: 1, borderRadius: 14, padding: 14, marginBottom: 14 },
-  simNoticeTitle: { color: '#F87171', fontSize: 11, fontWeight: '900', letterSpacing: 1, marginBottom: 6 },
-  simNoticeText: { color: '#D4C8CA', fontSize: 10, lineHeight: 16 },
-  warning: { backgroundColor: '#1C130D', borderColor: '#74481F', borderWidth: 1, borderRadius: 16, padding: 16, marginBottom: 16 },
-  warningTitle: { color: '#F59E0B', fontSize: 11, fontWeight: '900', letterSpacing: 1 },
-  warningText: { color: '#C7B9A3', fontSize: 10, lineHeight: 16, marginTop: 4 },
-  rule: { height: 1, backgroundColor: '#442C1A', marginVertical: 11 },
-  safetyHeadline: { color: '#F59E0B', fontSize: 10, fontWeight: '900', letterSpacing: 1, marginBottom: 6 },
-  safetyItem: { color: '#E5D5BA', fontSize: 10, marginBottom: 3 },
-  lockBanner: { backgroundColor: '#7F1D1D', padding: 10, borderRadius: 8, marginTop: 10 },
-  lockBannerText: { color: '#FCA5A5', fontSize: 10, fontWeight: '900' },
-  section: { color: '#fff', fontSize: 12, fontWeight: '900', letterSpacing: 1.8, marginTop: 22, marginBottom: 12 },
-  effect: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: '#110D0F', borderColor: '#2E161A', borderWidth: 1, borderRadius: 14, padding: 14, marginBottom: 10 },
-  selected: { borderColor: '#DC2626', backgroundColor: '#1B0E11' },
-  number: { color: '#EF4444', fontSize: 14, fontWeight: '900', width: 22 },
-  effectName: { color: '#fff', fontSize: 11, fontWeight: '900', letterSpacing: 0.6 },
-  effectSub: { color: '#8A7E82', fontSize: 10, marginTop: 4, lineHeight: 14 },
-  policeTag: { backgroundColor: '#7F1D1D', paddingHorizontal: 5, paddingVertical: 2, borderRadius: 4 },
-  policeTagText: { color: '#FECACA', fontSize: 7, fontWeight: '900', letterSpacing: 0.6 },
-  badgeBox: { paddingVertical: 5, paddingHorizontal: 8, borderRadius: 6, backgroundColor: '#261114' },
-  preview: { color: '#FCA5A5', fontSize: 8, fontWeight: '900', letterSpacing: 0.7 },
-  previewBox: { backgroundColor: '#0E0B0C', borderRadius: 16, borderWidth: 1, borderColor: '#3A151B', padding: 16, marginBottom: 14 },
-  previewTitle: { color: '#EF4444', fontSize: 10, fontWeight: '900', letterSpacing: 1.4, textAlign: 'center' },
-  carGraphicBox: { marginVertical: 14, padding: 18, backgroundColor: '#050507', borderRadius: 12, borderWidth: 1, borderColor: '#261316' },
-  headlightRow: { flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center' },
-  carLamp: { width: 20, height: 20, borderRadius: 10, backgroundColor: '#221C1E' },
-  carLampLarge: { width: 36, height: 36, borderRadius: 18, backgroundColor: '#221C1E' },
-  carGrille: { paddingHorizontal: 12 },
-  previewButton: { backgroundColor: '#DC2626', padding: 14, borderRadius: 10, alignItems: 'center', marginTop: 4 },
-  previewButtonText: { color: '#fff', fontSize: 10, fontWeight: '900', letterSpacing: 1 },
-  previewNote: { color: '#8A7E82', fontSize: 9, textAlign: 'center', marginTop: 6 },
-  vehicleControlPanel: { marginTop: 4, backgroundColor: '#110D0F', borderColor: '#4A1820', borderWidth: 1, borderRadius: 16, padding: 16 },
-  switchRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
-  switchLabel: { color: '#fff', fontSize: 11, fontWeight: '800' },
-  switchHint: { color: '#94868A', fontSize: 9, marginTop: 3 },
-  progressBox: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: '#1C0F12', padding: 12, borderRadius: 10, marginVertical: 10 },
-  progressText: { color: '#FECACA', fontSize: 10, fontWeight: '700' },
-  progressPercent: { color: '#EF4444', fontSize: 9, marginTop: 2 },
-  primaryButton: { backgroundColor: '#DC2626', padding: 16, borderRadius: 12, alignItems: 'center' },
-  primaryButtonText: { color: '#fff', fontSize: 10, fontWeight: '900', letterSpacing: 1.1 },
-  disabledButton: { backgroundColor: '#2A1B1E', opacity: 0.6 },
-  panicButton: { backgroundColor: '#991B1B', borderWidth: 1, borderColor: '#EF4444', paddingHorizontal: 14, paddingVertical: 16, borderRadius: 12, justifyContent: 'center', alignItems: 'center' },
-  panicButtonText: { color: '#fff', fontSize: 10, fontWeight: '900' },
-  consoleTitle: { color: '#EF4444', fontSize: 9, fontWeight: '900', letterSpacing: 1, marginTop: 16, marginBottom: 8 },
-  consoleBox: { backgroundColor: '#050507', borderRadius: 10, borderWidth: 1, borderColor: '#2E161A', maxHeight: 180, overflow: 'hidden' },
-  consoleContent: { padding: 10 },
-  consoleEmpty: { color: '#6E6266', fontSize: 9, fontStyle: 'italic', textAlign: 'center', paddingVertical: 12 },
-  logRow: { flexDirection: 'row', gap: 6, marginBottom: 4 },
-  logDirection: { fontSize: 9, fontWeight: '900', fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace' },
-  logText: { color: '#E2E8F0', fontSize: 9, flex: 1, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace' },
-  didTesterCard: { marginTop: 18, backgroundColor: '#110D0F', borderColor: '#74481F', borderWidth: 1, borderRadius: 16, padding: 16 },
-  didTesterTitle: { color: '#F59E0B', fontSize: 11, fontWeight: '900', letterSpacing: 1, marginBottom: 6 },
-  didTesterSub: { color: '#C7B9A3', fontSize: 10, lineHeight: 15, marginBottom: 12 },
-  didInputRow: { flexDirection: 'row', gap: 10, marginBottom: 12 },
-  didFieldLabel: { color: '#94868A', fontSize: 8, fontWeight: '800', letterSpacing: 1, marginBottom: 5 },
-  didInput: {
-    backgroundColor: '#050507',
+  content: { padding: 20, paddingTop: 68, paddingBottom: 140 },
+  brand: { color: '#EF4444', fontSize: 11, fontWeight: '900', letterSpacing: 5 },
+  title: { color: '#fff', fontSize: 28, fontWeight: '900', marginTop: 8 },
+  sub: { color: '#8E868A', fontSize: 10, letterSpacing: 2, marginTop: 4, marginBottom: 16 },
+  tabBar: {
+    flexDirection: 'row',
+    backgroundColor: '#110D0F',
+    borderRadius: 12,
+    padding: 4,
+    marginBottom: 16,
     borderWidth: 1,
-    borderColor: '#4A1820',
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: '#fff',
-    fontSize: 15,
-    fontWeight: '900',
-    letterSpacing: 2,
-    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    borderColor: '#2E161A',
   },
-  didTestButton: { backgroundColor: '#B45309', padding: 14, borderRadius: 10, alignItems: 'center' },
-  didTestButtonText: { color: '#fff', fontSize: 10, fontWeight: '900', letterSpacing: 1 },
-  scanButton: { backgroundColor: '#1D4ED8', padding: 14, borderRadius: 10, alignItems: 'center', marginBottom: 14 },
-  scanButtonText: { color: '#fff', fontSize: 10, fontWeight: '900', letterSpacing: 0.8 },
-  scanResultBox: {
-    backgroundColor: '#050507',
+  tabBtn: { flex: 1, paddingVertical: 10, alignItems: 'center', borderRadius: 9 },
+  tabBtnActive: { backgroundColor: '#DC2626' },
+  tabText: { color: '#94868A', fontSize: 10, fontWeight: '800', letterSpacing: 0.6 },
+  tabTextActive: { color: '#fff' },
+  speedoCard: {
+    backgroundColor: '#0E0B0C',
     borderWidth: 1,
-    borderColor: '#1E3A8A',
-    borderRadius: 10,
-    padding: 12,
+    borderColor: '#3A151B',
+    borderRadius: 20,
+    padding: 16,
     marginBottom: 14,
   },
-  scanResultHeader: { color: '#60A5FA', fontSize: 9, fontWeight: '900', letterSpacing: 0.8, marginBottom: 4 },
-  scanResultMeta: { color: '#E2E8F0', fontSize: 10, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace', marginBottom: 3 },
-  scanResultEmpty: { color: '#FCA5A5', fontSize: 10, marginTop: 6 },
-  didChipWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 8 },
-  didChip: { backgroundColor: '#3B2508', borderColor: '#B45309', borderWidth: 1, borderRadius: 6, paddingHorizontal: 8, paddingVertical: 5 },
-  didChipAccepted: { backgroundColor: '#064E3B', borderColor: '#10B981' },
-  didChipText: { color: '#fff', fontSize: 10, fontWeight: '800', fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace' },
-  disclaimer: { color: '#786D70', fontSize: 10, lineHeight: 17, textAlign: 'center', marginTop: 20 },
+  speedoHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 14,
+  },
+  warmPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: '#161114',
+    borderWidth: 1,
+    borderColor: '#2E161A',
+    borderRadius: 14,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  warmDot: { width: 7, height: 7, borderRadius: 4 },
+  warmText: { color: '#E2E8F0', fontSize: 9, fontWeight: '800', letterSpacing: 0.5 },
+  hudBtn: {
+    backgroundColor: '#18181B',
+    borderWidth: 1,
+    borderColor: '#3F3F46',
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  hudBtnActive: { backgroundColor: '#DC2626', borderColor: '#EF4444' },
+  hudBtnText: { color: '#D4D4D8', fontSize: 9, fontWeight: '800', letterSpacing: 0.6 },
+  speedoCenter: { alignItems: 'center', marginVertical: 6 },
+  telemetryRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 14,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#261316',
+  },
+  teleCell: { alignItems: 'center', flex: 1 },
+  teleLabel: { color: '#8E868A', fontSize: 8, fontWeight: '800', letterSpacing: 1 },
+  teleVal: { color: '#fff', fontSize: 13, fontWeight: '900', marginTop: 3 },
+  perfCard: {
+    backgroundColor: '#110D0F',
+    borderWidth: 1,
+    borderColor: '#3A151B',
+    borderRadius: 18,
+    padding: 16,
+    marginBottom: 14,
+  },
+  perfHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  perfTitle: { color: '#fff', fontSize: 11, fontWeight: '900', letterSpacing: 1 },
+  perfBadge: {
+    color: '#EF4444',
+    fontSize: 11,
+    fontWeight: '900',
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  },
+  splitGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 },
+  splitBox: {
+    width: '48%',
+    flexGrow: 1,
+    backgroundColor: '#07080B',
+    borderWidth: 1,
+    borderColor: '#27272A',
+    borderRadius: 12,
+    padding: 12,
+  },
+  splitBoxHighlight: { borderColor: '#DC2626', backgroundColor: '#1A0B0E' },
+  splitLabel: { color: '#9CA3AF', fontSize: 9, fontWeight: '800', letterSpacing: 0.6 },
+  splitVal: {
+    color: '#F8FAFC',
+    fontSize: 18,
+    fontWeight: '900',
+    marginTop: 4,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  },
+  actionRow: { flexDirection: 'row', gap: 10 },
+  primaryBtn: {
+    backgroundColor: '#DC2626',
+    borderRadius: 12,
+    padding: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  primaryBtnText: { color: '#fff', fontSize: 10, fontWeight: '900', letterSpacing: 1 },
+  secondaryBtn: {
+    backgroundColor: '#18181B',
+    borderWidth: 1,
+    borderColor: '#3F3F46',
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  secondaryBtnText: { color: '#E4E4E7', fontSize: 9, fontWeight: '900', letterSpacing: 0.6 },
+  disabledBtn: { backgroundColor: '#2A1B1E', opacity: 0.6 },
+  historyCard: {
+    backgroundColor: '#110D0F',
+    borderWidth: 1,
+    borderColor: '#2E161A',
+    borderRadius: 16,
+    padding: 14,
+    marginBottom: 14,
+  },
+  clearLink: { color: '#EF4444', fontSize: 10, fontWeight: '800' },
+  historyRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 7,
+    borderTopWidth: 1,
+    borderTopColor: '#221316',
+  },
+  historyDate: { color: '#71717A', fontSize: 10 },
+  historyMetric: { color: '#D4D4D8', fontSize: 10 },
+  card: {
+    backgroundColor: '#110D0F',
+    borderWidth: 1,
+    borderColor: '#3A151B',
+    borderRadius: 18,
+    padding: 16,
+    marginBottom: 14,
+  },
+  cardTitle: { color: '#fff', fontSize: 12, fontWeight: '900', letterSpacing: 1, marginBottom: 6 },
+  cardSub: { color: '#A1A1AA', fontSize: 10, lineHeight: 16, marginBottom: 14 },
+  airDiagram: {
+    backgroundColor: '#07080B',
+    borderWidth: 1,
+    borderColor: '#27272A',
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 14,
+    alignItems: 'center',
+  },
+  airRow: { flexDirection: 'row', gap: 10, width: '100%' },
+  bagBox: {
+    flex: 1,
+    backgroundColor: '#141418',
+    borderWidth: 1,
+    borderColor: '#3F3F46',
+    borderRadius: 10,
+    padding: 10,
+    alignItems: 'center',
+  },
+  bagBoxOk: { borderColor: '#10B981', backgroundColor: '#06281E' },
+  bagBoxWarn: { borderColor: '#EF4444', backgroundColor: '#2B0D11' },
+  bagCorner: { color: '#9CA3AF', fontSize: 8, fontWeight: '800', letterSpacing: 0.6 },
+  bagStatus: { color: '#fff', fontSize: 12, fontWeight: '900', marginTop: 4 },
+  carCenterIcon: { fontSize: 42, marginVertical: 10 },
+  reportBox: { marginTop: 14, borderRadius: 12, padding: 12, borderWidth: 1 },
+  reportBoxOk: { backgroundColor: '#06281E', borderColor: '#10B981' },
+  reportBoxErr: { backgroundColor: '#2B0D11', borderColor: '#EF4444' },
+  reportTitle: { color: '#fff', fontSize: 11, fontWeight: '900', marginBottom: 4 },
+  reportText: { color: '#E2E8F0', fontSize: 10, lineHeight: 15 },
+  reportMeta: {
+    color: '#93C5FD',
+    fontSize: 9,
+    marginTop: 6,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  },
+  dtcLine: {
+    color: '#FCA5A5',
+    fontSize: 10,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+    marginTop: 2,
+  },
+  progressNote: { color: '#93C5FD', fontSize: 10, textAlign: 'center', marginTop: 10 },
+  modRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderRadius: 10,
+    padding: 11,
+    borderWidth: 1,
+  },
+  modRowOk: { backgroundColor: '#071E17', borderColor: '#065F46' },
+  modRowFault: { backgroundColor: '#250B0E', borderColor: '#DC2626' },
+  modRowOff: { backgroundColor: '#141418', borderColor: '#27272A' },
+  modName: { color: '#fff', fontSize: 11, fontWeight: '800' },
+  modMeta: {
+    color: '#A1A1AA',
+    fontSize: 9,
+    marginTop: 3,
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+  },
+  clearModBtn: {
+    backgroundColor: '#991B1B',
+    borderRadius: 7,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    marginLeft: 8,
+  },
+  clearModText: { color: '#fff', fontSize: 9, fontWeight: '900' },
 });

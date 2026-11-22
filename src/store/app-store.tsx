@@ -3,6 +3,7 @@ import { Platform } from 'react-native';
 import * as FileSystem from 'expo-file-system/legacy';
 import { LiveData } from '@/services/obd-ble';
 import { VehicleCapabilities } from '@/services/vehicle-capabilities';
+import { PerformanceRunRecord } from '@/services/a8-diagnostics';
 
 export type Vehicle = {
   id: string;
@@ -23,6 +24,7 @@ type AppData = {
   capabilities: VehicleCapabilities | null;
   openAiApiKey: string;
   isSafetyUnlocked: boolean;
+  performanceRuns: PerformanceRunRecord[];
 };
 
 type Store = AppData & {
@@ -33,6 +35,8 @@ type Store = AppData & {
   setCapabilities: (caps: VehicleCapabilities | null) => void;
   setOpenAiApiKey: (key: string) => void;
   setSafetyUnlocked: (unlocked: boolean) => void;
+  addPerformanceRun: (run: PerformanceRunRecord) => void;
+  clearPerformanceRuns: () => void;
   addVehicle: (v: Omit<Vehicle, 'id'>) => void;
   removeVehicle: (id: string) => void;
   setActiveVehicle: (id: string) => void;
@@ -58,6 +62,7 @@ const initial: AppData = {
   capabilities: null,
   openAiApiKey: '',
   isSafetyUnlocked: false,
+  performanceRuns: [],
 };
 
 const StoreContext = createContext<Store | null>(null);
@@ -118,6 +123,12 @@ export function AppStoreProvider({ children }: { children: React.ReactNode }) {
       setCapabilities: capabilities => setData(d => ({ ...d, capabilities })),
       setOpenAiApiKey: openAiApiKey => setData(d => ({ ...d, openAiApiKey })),
       setSafetyUnlocked: isSafetyUnlocked => setData(d => ({ ...d, isSafetyUnlocked })),
+      addPerformanceRun: run =>
+        setData(d => ({
+          ...d,
+          performanceRuns: [run, ...(d.performanceRuns || [])].slice(0, 20),
+        })),
+      clearPerformanceRuns: () => setData(d => ({ ...d, performanceRuns: [] })),
       addVehicle: v =>
         setData(d => {
           const id = `vehicle-${Date.now()}`;

@@ -17,8 +17,8 @@ export default function AppTabs() {
       </NativeTabs.Trigger>
 
       <NativeTabs.Trigger name="light-show">
-        <NativeTabs.Trigger.Label>Light Show</NativeTabs.Trigger.Label>
-        <NativeTabs.Trigger.Icon sf="bolt.fill" md="bolt" />
+        <NativeTabs.Trigger.Label>A8 Cockpit</NativeTabs.Trigger.Label>
+        <NativeTabs.Trigger.Icon sf="gauge.with.dots.needle.67percent" md="speed" />
       </NativeTabs.Trigger>
 
       <NativeTabs.Trigger name="settings">

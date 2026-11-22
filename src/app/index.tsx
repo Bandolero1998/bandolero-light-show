@@ -77,9 +77,9 @@ export default function HomeScreen() {
         <Text style={s.section}>QUICK ACCESS</Text>
         <View style={s.grid}>
           <TouchableOpacity style={s.tile} onPress={() => router.push('/light-show' as any)}>
-            <Text style={s.tileIcon}>⚡</Text>
-            <Text style={s.tileTitle}>Light Show</Text>
-            <Text style={s.tileDesc}>Police Strobe & UDS Modovi</Text>
+            <Text style={s.tileIcon}>🏁</Text>
+            <Text style={s.tileTitle}>A8 Cockpit</Text>
+            <Text style={s.tileDesc}>Brzinomer, 0–100, Vešanje & 16 modula</Text>
           </TouchableOpacity>
           <TouchableOpacity style={s.tile} onPress={() => router.push('/garage')}>
             <Text style={s.tileIcon}>🚘</Text>
