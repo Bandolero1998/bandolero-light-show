@@ -148,8 +148,13 @@ export class ObdBleClient {
     reject: (error: Error) => void;
     timer: ReturnType<typeof setTimeout>;
   } | null = null;
+  private commandQueue: Promise<any> = Promise.resolve();
   private disconnectHandler: (() => void) | null = null;
   private pollingTimer: ReturnType<typeof setInterval> | null = null;
+  private pollingActive = false;
+  private pollingPaused = false;
+  private pollingCallback: ((data: LiveData) => void) | null = null;
+  private pollingIntervalMs = 800;
   private capabilities: VehicleCapabilities | null = null;
 
   constructor() {
@@ -449,14 +454,25 @@ export class ObdBleClient {
   }
 
   /**
-   * Sends an AT or OBD hex command and awaits the prompt response.
+   * Sends an AT or OBD hex command through a strict FIFO Promise queue
+   * so concurrent callers (e.g. TesterPresent + actuator frames) never collide.
    */
-  async command(cmd: string, timeout = 3500): Promise<string> {
+  command(cmd: string, timeout = 3500): Promise<string> {
+    if (!this.writer || !this.device) {
+      return Promise.reject(new Error('OBD adapter nije povezan.'));
+    }
+
+    const task = this.commandQueue
+      .catch(() => {})
+      .then(() => this.executeCommandNow(cmd, timeout));
+
+    this.commandQueue = task.catch(() => {});
+    return task;
+  }
+
+  private async executeCommandNow(cmd: string, timeout = 3500): Promise<string> {
     if (!this.writer || !this.device) {
       throw new Error('OBD adapter nije povezan.');
-    }
-    if (this.pending) {
-      throw new Error('OBD komunikacija je zauzeta prethodnom komandom.');
     }
 
     this.buffer = '';
@@ -469,18 +485,26 @@ export class ObdBleClient {
     });
 
     const payloadBase64 = toBase64(`${cmd}\r`);
-    if (this.writer.isWritableWithResponse) {
-      await this.device.writeCharacteristicWithResponseForService(
-        this.writer.serviceUUID,
-        this.writer.uuid,
-        payloadBase64
-      );
-    } else {
-      await this.device.writeCharacteristicWithoutResponseForService(
-        this.writer.serviceUUID,
-        this.writer.uuid,
-        payloadBase64
-      );
+    try {
+      if (this.writer.isWritableWithResponse) {
+        await this.device.writeCharacteristicWithResponseForService(
+          this.writer.serviceUUID,
+          this.writer.uuid,
+          payloadBase64
+        );
+      } else {
+        await this.device.writeCharacteristicWithoutResponseForService(
+          this.writer.serviceUUID,
+          this.writer.uuid,
+          payloadBase64
+        );
+      }
+    } catch (writeErr: any) {
+      if (this.pending) {
+        clearTimeout(this.pending.timer);
+        this.pending = null;
+      }
+      throw writeErr;
     }
 
     return responsePromise;
@@ -547,13 +571,26 @@ export class ObdBleClient {
 
   /**
    * Reads a full snapshot of live OBD-II metrics and DTCs.
+   * Stops immediately between PIDs if polling is paused (e.g., during Light Show UDS session).
    */
-  async readLiveData(): Promise<LiveData> {
+  async readLiveData(options: { abortOnPause?: boolean } = {}): Promise<LiveData> {
+    const abortOnPause = options.abortOnPause ?? false;
     const result: LiveData = {
       dtcs: [],
       pendingDtcs: [],
       permanentDtcs: [],
       timestamp: Date.now(),
+    };
+
+    const shouldAbort = () => !this.isConnected || (abortOnPause && this.pollingPaused);
+
+    const query = async (cmd: string, timeout: number): Promise<string | null> => {
+      if (shouldAbort()) return null;
+      try {
+        return await this.command(cmd, timeout);
+      } catch {
+        return null;
+      }
     };
 
     const isSupported = (pid: string) => {
@@ -562,149 +599,155 @@ export class ObdBleClient {
     };
 
     // Engine RPM (010C)
-    if (isSupported('0C')) {
-      try {
-        const r = await this.command('010C', 2500);
+    if (isSupported('0C') && !shouldAbort()) {
+      const r = await query('010C', 2500);
+      if (r) {
         const val = Elm327Protocol.parsePidValue('0C', r);
         if (typeof val === 'number') result.rpm = val;
-      } catch {}
+      }
     }
 
     // Vehicle Speed (010D)
-    if (isSupported('0D')) {
-      try {
-        const r = await this.command('010D', 2500);
+    if (isSupported('0D') && !shouldAbort()) {
+      const r = await query('010D', 2500);
+      if (r) {
         const val = Elm327Protocol.parsePidValue('0D', r);
         if (typeof val === 'number') result.speed = val;
-      } catch {}
+      }
     }
 
     // Engine Coolant Temperature (0105)
-    if (isSupported('05')) {
-      try {
-        const r = await this.command('0105', 2500);
+    if (isSupported('05') && !shouldAbort()) {
+      const r = await query('0105', 2500);
+      if (r) {
         const val = Elm327Protocol.parsePidValue('05', r);
         if (typeof val === 'number') result.coolant = val;
-      } catch {}
+      }
     }
 
     // Intake Air Temperature (010F)
-    if (isSupported('0F')) {
-      try {
-        const r = await this.command('010F', 2500);
+    if (isSupported('0F') && !shouldAbort()) {
+      const r = await query('010F', 2500);
+      if (r) {
         const val = Elm327Protocol.parsePidValue('0F', r);
         if (typeof val === 'number') result.intake = val;
-      } catch {}
+      }
     }
 
     // Throttle Position (0111)
-    if (isSupported('11')) {
-      try {
-        const r = await this.command('0111', 2500);
+    if (isSupported('11') && !shouldAbort()) {
+      const r = await query('0111', 2500);
+      if (r) {
         const val = Elm327Protocol.parsePidValue('11', r);
         if (typeof val === 'number') result.throttle = val;
-      } catch {}
+      }
     }
 
     // Calculated Engine Load (0104)
-    if (isSupported('04')) {
-      try {
-        const r = await this.command('0104', 2500);
+    if (isSupported('04') && !shouldAbort()) {
+      const r = await query('0104', 2500);
+      if (r) {
         const val = Elm327Protocol.parsePidValue('04', r);
         if (typeof val === 'number') result.engineLoad = val;
-      } catch {}
+      }
     }
 
     // MAF Air Flow Rate (0110)
-    if (isSupported('10')) {
-      try {
-        const r = await this.command('0110', 2500);
+    if (isSupported('10') && !shouldAbort()) {
+      const r = await query('0110', 2500);
+      if (r) {
         const val = Elm327Protocol.parsePidValue('10', r);
         if (typeof val === 'number') result.maf = val;
-      } catch {}
+      }
     }
 
     // Fuel Tank Level (012F)
-    if (isSupported('2F')) {
-      try {
-        const r = await this.command('012F', 2500);
+    if (isSupported('2F') && !shouldAbort()) {
+      const r = await query('012F', 2500);
+      if (r) {
         const val = Elm327Protocol.parsePidValue('2F', r);
         if (typeof val === 'number') result.fuelLevel = val;
-      } catch {}
+      }
     }
 
     // Engine Oil Temperature (015C - common on VAG TDI)
-    if (isSupported('5C')) {
-      try {
-        const r = await this.command('015C', 2500);
+    if (isSupported('5C') && !shouldAbort()) {
+      const r = await query('015C', 2500);
+      if (r) {
         const val = Elm327Protocol.parsePidValue('5C', r);
         if (typeof val === 'number') result.oilTemp = val;
-      } catch {}
+      }
     }
 
     // Ambient Air Temperature (0146)
-    if (isSupported('46')) {
-      try {
-        const r = await this.command('0146', 2500);
+    if (isSupported('46') && !shouldAbort()) {
+      const r = await query('0146', 2500);
+      if (r) {
         const val = Elm327Protocol.parsePidValue('46', r);
         if (typeof val === 'number') result.ambientTemp = val;
-      } catch {}
+      }
     }
 
     // Fuel Rail Pressure (0123 - diesel common rail for Audi 4.2 TDI)
-    if (isSupported('23')) {
-      try {
-        const r = await this.command('0123', 2500);
+    if (isSupported('23') && !shouldAbort()) {
+      const r = await query('0123', 2500);
+      if (r) {
         const val = Elm327Protocol.parsePidValue('23', r);
         if (typeof val === 'number') result.fuelRailPressure = val;
-      } catch {}
+      }
     }
 
     // Control Module Voltage (0142)
-    if (isSupported('42')) {
-      try {
-        const r = await this.command('0142', 2500);
+    if (isSupported('42') && !shouldAbort()) {
+      const r = await query('0142', 2500);
+      if (r) {
         const val = Elm327Protocol.parsePidValue('42', r);
         if (typeof val === 'number') result.controlModuleVoltage = val;
-      } catch {}
+      }
     }
 
     // Battery Voltage via ATRV
-    try {
-      const v = await this.command('ATRV', 2000);
-      const num = parseFloat(v.replace(/[^0-9.]/g, ''));
-      if (!isNaN(num)) result.voltage = num;
-    } catch {}
+    if (!shouldAbort()) {
+      const v = await query('ATRV', 2000);
+      if (v) {
+        const num = parseFloat(v.replace(/[^0-9.]/g, ''));
+        if (!isNaN(num)) result.voltage = num;
+      }
+    }
 
     // MIL Status & DTC Count (0101)
-    if (isSupported('01')) {
-      try {
-        const r = await this.command('0101', 2500);
+    if (isSupported('01') && !shouldAbort()) {
+      const r = await query('0101', 2500);
+      if (r) {
         const milVal = Elm327Protocol.parsePidValue('01', r);
         if (typeof milVal === 'boolean') result.mil = milVal;
-      } catch {}
+      }
     }
 
     // Distance traveled with MIL on (0121)
-    if (isSupported('21')) {
-      try {
-        const r = await this.command('0121', 2500);
+    if (isSupported('21') && !shouldAbort()) {
+      const r = await query('0121', 2500);
+      if (r) {
         const val = Elm327Protocol.parsePidValue('21', r);
         if (typeof val === 'number') result.milDistance = val;
-      } catch {}
+      }
     }
 
     // Stored Fault Codes (Mode 03)
-    try {
-      const dtcResp = await this.command('03', 3500);
-      result.dtcs = Elm327Protocol.parseDtcs(dtcResp, '03');
-    } catch {}
+    if (!shouldAbort()) {
+      const dtcResp = await query('03', 3500);
+      if (dtcResp) {
+        result.dtcs = Elm327Protocol.parseDtcs(dtcResp, '03');
+      }
+    }
 
     // Pending Fault Codes (Mode 07)
-    try {
-      const pResp = await this.command('07', 3000);
-      result.pendingDtcs = Elm327Protocol.parseDtcs(pResp, '07');
-    } catch {}
+    if (!shouldAbort()) {
+      const pResp = await query('07', 3000);
+      if (pResp) {
+        result.pendingDtcs = Elm327Protocol.parseDtcs(pResp, '07');
+      }
+    }
 
     return result;
   }
@@ -723,22 +766,57 @@ export class ObdBleClient {
    * Starts a continuous live polling loop for real-time dashboard display.
    */
   startPolling(onData: (data: LiveData) => void, intervalMs = 800) {
-    this.stopPolling();
+    if (this.pollingTimer) {
+      clearInterval(this.pollingTimer);
+      this.pollingTimer = null;
+    }
+    this.pollingActive = true;
+    this.pollingPaused = false;
+    this.pollingCallback = onData;
+    this.pollingIntervalMs = intervalMs;
+
     let isFetching = false;
 
     this.pollingTimer = setInterval(async () => {
-      if (isFetching || !this.isConnected) return;
+      if (isFetching || this.pollingPaused || !this.isConnected) return;
       isFetching = true;
       try {
-        const data = await this.readLiveData();
-        onData(data);
+        const data = await this.readLiveData({ abortOnPause: true });
+        if (!this.pollingPaused) {
+          onData(data);
+        }
       } catch {} finally {
         isFetching = false;
       }
     }, intervalMs);
   }
 
+  /**
+   * Temporarily pauses background polling (e.g. during Light Show UDS sequence)
+   * without discarding the callback so resumePolling() can restart it cleanly.
+   */
+  pausePolling() {
+    this.pollingPaused = true;
+    if (this.pollingTimer) {
+      clearInterval(this.pollingTimer);
+      this.pollingTimer = null;
+    }
+  }
+
+  /**
+   * Resumes background polling if it was active before pausePolling().
+   */
+  resumePolling() {
+    this.pollingPaused = false;
+    if (this.pollingActive && this.pollingCallback && this.isConnected && !this.pollingTimer) {
+      this.startPolling(this.pollingCallback, this.pollingIntervalMs);
+    }
+  }
+
   stopPolling() {
+    this.pollingActive = false;
+    this.pollingPaused = true;
+    this.pollingCallback = null;
     if (this.pollingTimer) {
       clearInterval(this.pollingTimer);
       this.pollingTimer = null;
@@ -755,6 +833,7 @@ export class ObdBleClient {
       this.pending.reject(new Error('Veza sa OBD adapterom je prekinuta.'));
       this.pending = null;
     }
+    this.commandQueue = Promise.resolve();
     const currentDevice = this.device;
     this.device = null;
     this.writer = null;

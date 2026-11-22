@@ -17,10 +17,18 @@ test('LightShowController provides configured effects with testing indicators', 
 
 test('LightShowController parses ATS0 dual-ECU 410D00 response and completes UDS sequence', async () => {
   const sent: string[] = [];
+  let pollingPausedCount = 0;
+  let pollingResumedCount = 0;
   const mockClient = {
     isConnected: true,
     isBusy: false,
     stopPolling() {},
+    pausePolling() {
+      pollingPausedCount++;
+    },
+    resumePolling() {
+      pollingResumedCount++;
+    },
     async command(cmd: string): Promise<string> {
       sent.push(cmd);
       if (cmd === '010D') return '410D00 410D00>';
@@ -35,6 +43,8 @@ test('LightShowController parses ATS0 dual-ECU 410D00 response and completes UDS
   const res = await controller.runVehicleSequence('highbeam');
 
   assert.strictEqual(res.success, true);
+  assert.strictEqual(pollingPausedCount, 1);
+  assert.strictEqual(pollingResumedCount, 1);
   // Verify exact pre-check and UDS sequence order
   assert.strictEqual(sent[0], 'ATSH 7DF');
   assert.strictEqual(sent[1], 'ATCRA');

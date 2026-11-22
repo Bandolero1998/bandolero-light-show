@@ -287,6 +287,8 @@ export class LightShowController {
         this.log('INFO', 'Kontrola svetala vraćena računaru vozila (10 01 / ATSH 7DF).');
       } catch (err: any) {
         this.log('ERROR', `Greška pri bezbednosnom resetovanju: ${err?.message}`);
+      } finally {
+        this.client.resumePolling?.();
       }
     } else {
       this.udsSessionActive = false;
@@ -310,8 +312,12 @@ export class LightShowController {
       throw new Error('OBD adapter nije povezan. Prvo poveži VLinker BM+ u Settings tabu.');
     }
 
-    // Pause live dashboard polling and wait for any in-flight BLE frame to finish
-    this.client.stopPolling();
+    // Temporarily pause background live polling (and wait for any in-flight PID frame to finish)
+    if (typeof this.client.pausePolling === 'function') {
+      this.client.pausePolling();
+    } else {
+      this.client.stopPolling();
+    }
     await this.waitUntilIdle(2000);
 
     this.isRunning = true;
@@ -495,6 +501,7 @@ export class LightShowController {
       this.stopTesterPresentLoop();
       this.udsSessionActive = false;
       this.isRunning = false;
+      this.client?.resumePolling?.();
     }
   }
 }
