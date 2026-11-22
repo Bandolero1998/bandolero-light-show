@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import { AVAILABLE_EFFECTS, LightShowController, parseUds2fResponse } from '../src/services/light-show-controller';
+import {
+  AVAILABLE_EFFECTS,
+  LightShowController,
+  decodeUdsAsciiPayload,
+  parseUds2fResponse,
+} from '../src/services/light-show-controller';
 import type { ObdBleClient } from '../src/services/obd-ble';
 
 test('LightShowController provides configured effects with testing indicators', () => {
@@ -128,4 +133,41 @@ test('LightShowController.testManualDid sends 10 03, 2F <DID> 03 01, 2F <DID> 00
   assert.strictEqual(sent[sent.length - 3], '10 01');
   assert.strictEqual(sent[sent.length - 2], 'ATSH 7DF');
   assert.strictEqual(sent[sent.length - 1], 'ATCRA');
+});
+
+test('decodeUdsAsciiPayload extracts VW/Audi Part Number from 22 F1 87 ISO-TP response', () => {
+  // "4H0907063  " in hex: 34 48 30 39 30 37 30 36 33 20 20
+  const raw = '0: 62 F1 87 34 48 30\r1: 39 30 37 30 36 33 20 20>';
+  assert.strictEqual(decodeUdsAsciiPayload(raw, '62F187'), '4H0907063');
+});
+
+test('LightShowController.scanModule09Dids reads Part Number and discovers valid 2F DIDs', async () => {
+  const mockClient = {
+    isConnected: true,
+    isBusy: false,
+    stopPolling() {},
+    pausePolling() {},
+    resumePolling() {},
+    async command(cmd: string): Promise<string> {
+      if (cmd === '010D') return '410D00>';
+      if (cmd === '22 F1 87') return '0: 62 F1 87 34 48 30\r1: 39 30 37 30 36 33>';
+      if (cmd === '22 F1 97') return '62F19742434D31>';
+      if (cmd === '10 03') return '5003003201F4>';
+      if (cmd === '2F3B1200') return '6F3B1200>';
+      if (cmd === '2F540100') return '7F2F33>';
+      if (cmd.startsWith('2F')) return '7F2F31>';
+      return 'OK>';
+    },
+  } as unknown as ObdBleClient;
+
+  const controller = new LightShowController(mockClient);
+  const res = await controller.scanModule09Dids();
+
+  assert.strictEqual(res.partNumber, '4H0907063');
+  assert.strictEqual(res.systemName, 'BCM1');
+  assert.strictEqual(res.discoveredDids.length, 2);
+  assert.strictEqual(res.discoveredDids[0].did, '3B12');
+  assert.strictEqual(res.discoveredDids[0].status, '6F');
+  assert.strictEqual(res.discoveredDids[1].did, '5401');
+  assert.strictEqual(res.discoveredDids[1].nrc, '33');
 });

@@ -154,6 +154,39 @@ export type Uds2fResult = {
   rawClean: string;
 };
 
+export type DiscoveredDid = {
+  did: string;
+  status: '6F' | 'NRC';
+  nrc?: string;
+  detail: string;
+};
+
+export type Module09ScanResult = {
+  targetLabel: string;
+  partNumber: string | null;
+  systemName: string | null;
+  sessionResponse: string;
+  discoveredDids: DiscoveredDid[];
+  scannedCount: number;
+};
+
+export function decodeUdsAsciiPayload(rawResponse: string, expectedPositivePrefix: string): string | null {
+  const clean = Elm327Protocol.reassembleIsoTp(rawResponse);
+  const prefix = expectedPositivePrefix.toUpperCase();
+  const idx = clean.indexOf(prefix);
+  if (idx === -1) return null;
+  const payload = clean.slice(idx + prefix.length);
+  let ascii = '';
+  for (let i = 0; i + 1 < payload.length; i += 2) {
+    const code = parseInt(payload.slice(i, i + 2), 16);
+    if (code >= 32 && code <= 126) {
+      ascii += String.fromCharCode(code);
+    }
+  }
+  const trimmed = ascii.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 const UDS_NRC_DESCRIPTIONS: Record<string, string> = {
   '11': 'ServiceNotSupported (usluga 2F nije podržana)',
   '12': 'SubFunctionNotSupported (nepodržana podfunkcija)',
@@ -703,6 +736,176 @@ export class LightShowController {
       };
     } catch (error: any) {
       this.log('ERROR', `Prekid DID testa: ${error?.message || error}`);
+      await this.emergencyStop();
+      throw error;
+    } finally {
+      this.udsSessionActive = false;
+      this.isRunning = false;
+      this.client?.resumePolling?.();
+    }
+  }
+
+  /**
+   * Reads Audi A8 D4 Module 09 (BCM1) Part Number (22 F1 87) & System Name (22 F1 97),
+   * opens Extended Session (10 03), and safely scans common VAG UDS 0x2F DID ranges
+   * using non-destructive ReturnControlToECU (2F <DID> 00) to discover all supported DIDs.
+   */
+  async scanModule09Dids(
+    onProgress?: (step: string, percent: number) => void
+  ): Promise<Module09ScanResult> {
+    if (this.isRunning) {
+      throw new Error('Sekvenca je već u toku.');
+    }
+    if (!this.client || !this.client.isConnected) {
+      throw new Error('OBD adapter nije povezan. Prvo poveži VLinker BM+ u Settings tabu.');
+    }
+
+    if (typeof this.client.pausePolling === 'function') {
+      this.client.pausePolling();
+    } else {
+      this.client.stopPolling();
+    }
+    await this.waitUntilIdle(2000);
+
+    this.isRunning = true;
+    this.abortRequested = false;
+    this.udsSessionActive = false;
+
+    this.log('INFO', '=== SKENIRANJE MODULA 09 (PART # + 2F DID DISCOVERY) ===');
+
+    try {
+      // 1. Stationary safety check
+      onProgress?.('Provera mirovanja (ATSH 7DF / 010D)...', 5);
+      await this.exec('ATSH 7DF', 2000);
+      await this.exec('ATCRA', 2000);
+      const speedRaw = await this.exec('010D', 3000);
+      const parsedSpeed = Elm327Protocol.parsePidValue('0D', speedRaw);
+      const speed = typeof parsedSpeed === 'number' ? parsedSpeed : undefined;
+      if (speed === undefined) {
+        throw new Error('Brzina vozila (PID 010D) nije očitana.');
+      }
+      if (speed > 0) {
+        throw new Error(`VOZILO U POKRETU (${speed} km/h) — skeniranje je blokirano dok vozilo ne stane.`);
+      }
+
+      // 2. Identify active Module 09 target & read Part Number (22 F1 87) + System Name (22 F1 97)
+      let activeTarget = LightShowController.MODULE09_TARGETS[0];
+      let partNumber: string | null = null;
+      let systemName: string | null = null;
+      let sessionResponse = 'NO DATA';
+
+      for (const target of LightShowController.MODULE09_TARGETS) {
+        if (this.abortRequested) break;
+        onProgress?.(`Identifikacija ${target.label} (22 F1 87)...`, 12);
+        await this.exec(`ATSH ${target.tx}`, 2000);
+        await this.exec(`ATCRA ${target.rx}`, 2000);
+
+        const pnRaw = await this.exec('22 F1 87', 3000).catch(() => '');
+        const pn = decodeUdsAsciiPayload(pnRaw, '62F187');
+        const snRaw = await this.exec('22 F1 97', 2500).catch(() => '');
+        const sn = decodeUdsAsciiPayload(snRaw, '62F197');
+        const sessRaw = await this.exec('10 03', 3000).catch(() => '');
+        const cleanSess = Elm327Protocol.cleanResponse(sessRaw);
+
+        if (pn || sn || cleanSess.includes('5003') || cleanSess.includes('7F10')) {
+          activeTarget = target;
+          partNumber = pn;
+          systemName = sn;
+          sessionResponse = cleanSess || 'NO DATA';
+          this.udsSessionActive = true;
+          this.log(
+            'INFO',
+            `Pronađen modul na ${target.label}: Part#=${pn || 'nepoznat'}, Name=${sn || 'nepoznat'}, Session=${sessionResponse}`
+          );
+          break;
+        }
+      }
+
+      if (!this.udsSessionActive) {
+        throw new Error('Modul 09 nije odgovorio ni na 0x70E ni na 0x710. Proveri da li je kontakt uključen.');
+      }
+
+      // 3. Build VAG UDS 0x2F candidate DID ranges (256 non-destructive probes: 2F <DID> 00)
+      const ranges: { start: number; end: number; label: string }[] = [
+        { start: 0x3b00, end: 0x3b3f, label: '3B00–3B3F' },
+        { start: 0x5400, end: 0x543f, label: '5400–543F' },
+        { start: 0xf400, end: 0xf43f, label: 'F400–F43F' },
+        { start: 0x0200, end: 0x023f, label: '0200–023F' },
+      ];
+
+      const allDids: string[] = [];
+      for (const r of ranges) {
+        for (let id = r.start; id <= r.end; id++) {
+          allDids.push(id.toString(16).toUpperCase().padStart(4, '0'));
+        }
+      }
+
+      const discoveredDids: DiscoveredDid[] = [];
+      let scannedCount = 0;
+
+      for (let i = 0; i < allDids.length; i++) {
+        if (this.abortRequested) break;
+        const did = allDids[i];
+
+        // Keep Extended Session alive every 35 queries
+        if (i > 0 && i % 35 === 0) {
+          await this.client.command('3E 80', 1200).catch(() => {});
+        }
+
+        if (i % 16 === 0) {
+          const pct = Math.min(92, 18 + Math.round((i / allDids.length) * 74));
+          onProgress?.(`Skeniram DID 0x${did} (${i}/${allDids.length}) — pronađeno: ${discoveredDids.length}`, pct);
+        }
+
+        let rx = '';
+        try {
+          rx = await this.client.command(`2F${did}00`, 1200);
+        } catch {
+          continue;
+        }
+        scannedCount++;
+
+        const parsed = parseUds2fResponse(rx);
+        if (parsed.accepted) {
+          const hit: DiscoveredDid = { did, status: '6F', detail: `6F (${parsed.rawClean})` };
+          discoveredDids.push(hit);
+          this.log('INFO', `✅ PRONAĐEN DID 0x${did}: pozitivan 6F odgovor (${parsed.rawClean})`);
+        } else if (parsed.nrc && parsed.nrc !== '31') {
+          // NRC != 31 (e.g. 33 SecurityAccess, 22 ConditionsNotCorrect, 13 Length) means DID EXISTS!
+          const hit: DiscoveredDid = {
+            did,
+            status: 'NRC',
+            nrc: parsed.nrc,
+            detail: `7F 2F ${parsed.nrc} (${parsed.nrcDescription})`,
+          };
+          discoveredDids.push(hit);
+          this.log('INFO', `⚡ POSTOJEĆI DID 0x${did}: 7F 2F ${parsed.nrc} — ${parsed.nrcDescription}`);
+        }
+      }
+
+      // 4. Clean teardown
+      onProgress?.('Zatvaranje sesije (10 01 / ATSH 7DF)...', 96);
+      await this.exec('10 01', 2000).catch(() => {});
+      this.udsSessionActive = false;
+      await this.exec('ATSH 7DF', 2000).catch(() => {});
+      await this.exec('ATCRA', 2000).catch(() => {});
+
+      onProgress?.('Skeniranje završeno.', 100);
+      this.log(
+        'INFO',
+        `Skeniranje završeno (${scannedCount} DID-ova). Part#: ${partNumber || 'N/A'} | Pronađeno validnih DID-ova: ${discoveredDids.length}.`
+      );
+
+      return {
+        targetLabel: activeTarget.label,
+        partNumber,
+        systemName,
+        sessionResponse,
+        discoveredDids,
+        scannedCount,
+      };
+    } catch (error: any) {
+      this.log('ERROR', `Greška pri skeniranju Modula 09: ${error?.message || error}`);
       await this.emergencyStop();
       throw error;
     } finally {

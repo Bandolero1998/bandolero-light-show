@@ -17,6 +17,7 @@ import {
   CommandLogEntry,
   LightEffectId,
   LightShowController,
+  Module09ScanResult,
 } from '@/services/light-show-controller';
 import { SafetyInterlock } from '@/services/safety-interlock';
 import { getSharedObdClient } from '@/services/obd-ble';
@@ -118,6 +119,8 @@ export default function LightShowScreen() {
   const [manualDid, setManualDid] = useState('F123');
   const [manualState, setManualState] = useState('01');
   const [isTestingDid, setIsTestingDid] = useState(false);
+  const [isScanningDids, setIsScanningDids] = useState(false);
+  const [scanResult, setScanResult] = useState<Module09ScanResult | null>(null);
 
   const controllerRef = useRef<LightShowController | null>(null);
 
@@ -233,10 +236,67 @@ export default function LightShowScreen() {
       await controllerRef.current?.emergencyStop();
       setIsExecutingVehicle(false);
       setIsTestingDid(false);
+      setIsScanningDids(false);
       setVehicleProgress(null);
       Alert.alert('Zaustavljeno', 'TesterPresent je ugašen, sesija vraćena (10 01) i header resetovan na ATSH 7DF.');
     } catch (err: any) {
       Alert.alert('Greška', err?.message || 'Greška pri prinudnom zaustavljanju.');
+    }
+  };
+
+  const handleScanModule09 = async () => {
+    if (!sharedClient.isConnected) {
+      Alert.alert(
+        'OBD adapter nije povezan',
+        'Aktivna Bluetooth sesija sa VLinker BM+ adapterom nije pronađena. Idi u Settings tab i poveži adapter.'
+      );
+      return;
+    }
+    if (hasMovingLock) {
+      Alert.alert(
+        'Bezbednosna blokada',
+        `Vozilo se kreće (${lastObdData?.speed} km/h). Skeniranje je dozvoljeno isključivo pri brzini 0 km/h.`
+      );
+      return;
+    }
+    if (!isSafetyUnlocked) {
+      Alert.alert(
+        'Potvrda bezbednosti',
+        'Uključi prekidač "Potvrđujem da vozilo bezbedno miruje" pre skeniranja Modula 09.'
+      );
+      return;
+    }
+
+    setIsScanningDids(true);
+    setScanResult(null);
+    try {
+      if (!controllerRef.current) {
+        controllerRef.current = new LightShowController(sharedClient, entry => {
+          setCommandLogs(prev => [entry, ...prev.slice(0, 59)]);
+        });
+      } else {
+        controllerRef.current.setClient(sharedClient);
+      }
+      const res = await controllerRef.current.scanModule09Dids((step, percent) => {
+        setVehicleProgress({ step, percent });
+      });
+      setScanResult(res);
+      const foundText =
+        res.discoveredDids.length > 0
+          ? `Pronađeno ${res.discoveredDids.length} validnih DID adresa:\n${res.discoveredDids
+              .slice(0, 12)
+              .map(d => `• ${d.did} (${d.status === '6F' ? '6F RADI' : `NRC ${d.nrc}`})`)
+              .join('\n')}`
+          : 'Nijedan DID iz standardnih opsega (3B/54/F4/02) nije odgovorio.';
+      Alert.alert(
+        'Skeniranje Modula 09 završeno',
+        `Modul: ${res.targetLabel}\nPart #: ${res.partNumber || 'Nije očitan'}\nNaziv: ${res.systemName || 'Nije očitan'}\nSesija (10 03): ${res.sessionResponse}\n\n${foundText}`
+      );
+    } catch (err: any) {
+      Alert.alert('Greška pri skeniranju', err?.message || 'Skeniranje Modula 09 nije uspelo.');
+    } finally {
+      setIsScanningDids(false);
+      setVehicleProgress(null);
     }
   };
 
@@ -544,13 +604,62 @@ export default function LightShowScreen() {
           </TouchableOpacity>
         ))}
 
-        {/* Manual 2F DID Tester (Debug on vehicle) */}
+        {/* Manual 2F DID Tester & Auto Scanner (Debug on vehicle) */}
         {mode === 'vehicle' && (
           <View style={s.didTesterCard}>
-            <Text style={s.didTesterTitle}>🔧 MANUAL 2F DID TESTER (AUDI A8 D4 DEBUG)</Text>
+            <Text style={s.didTesterTitle}>🔧 MODUL 09 SKENER & MANUAL 2F DID TESTER</Text>
             <Text style={s.didTesterSub}>
-              Šalje: 10 03 → 2F &lt;DID&gt; 03 &lt;STATE&gt; → pauza 1.5s → 2F &lt;DID&gt; 00 → 10 01. Odmah proverava 6F (radi) vs 7F (NRC kod).
+              1) Očitaj kataloški broj Modula 09 (22 F1 87) i automatski pronađi validne 2F DID adrese.{'\n'}
+              2) Klikni na pronađeni DID ili ga unesi ručno za test: 10 03 → 2F &lt;DID&gt; 03 &lt;STATE&gt; → 1.5s → 2F &lt;DID&gt; 00.
             </Text>
+
+            <TouchableOpacity
+              style={[
+                s.scanButton,
+                (!isConnected || hasMovingLock || !isSafetyUnlocked || isScanningDids || isTestingDid || isExecutingVehicle) &&
+                  s.disabledButton,
+              ]}
+              onPress={handleScanModule09}
+              disabled={!isConnected || hasMovingLock || !isSafetyUnlocked || isScanningDids || isTestingDid || isExecutingVehicle}
+            >
+              {isScanningDids ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={s.scanButtonText}>🔍 OČITAJ MODUL 09 (PART #) + PRONAĐI DID-OVE</Text>
+              )}
+            </TouchableOpacity>
+
+            {scanResult && (
+              <View style={s.scanResultBox}>
+                <Text style={s.scanResultHeader}>REZULTAT SKENIRANJA ({scanResult.targetLabel}):</Text>
+                <Text style={s.scanResultMeta}>
+                  Part #: {scanResult.partNumber || 'N/A'} · Naziv: {scanResult.systemName || 'N/A'}
+                </Text>
+                <Text style={s.scanResultMeta}>
+                  10 03: {scanResult.sessionResponse} · Skenirano: {scanResult.scannedCount} DID-ova
+                </Text>
+                {scanResult.discoveredDids.length > 0 ? (
+                  <View style={s.didChipWrap}>
+                    {scanResult.discoveredDids.map(item => (
+                      <TouchableOpacity
+                        key={item.did}
+                        style={[s.didChip, item.status === '6F' && s.didChipAccepted]}
+                        onPress={() => setManualDid(item.did)}
+                      >
+                        <Text style={s.didChipText}>
+                          {item.did} ({item.status === '6F' ? '6F' : `NRC ${item.nrc}`})
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                ) : (
+                  <Text style={s.scanResultEmpty}>
+                    Nijedan DID iz opsega 3B/54/F4/02 nije odgovorio (pošalji screenshot ovog rezultata).
+                  </Text>
+                )}
+              </View>
+            )}
+
             <View style={s.didInputRow}>
               <View style={{ flex: 2 }}>
                 <Text style={s.didFieldLabel}>4-CIFRENI HEX DID</Text>
@@ -582,10 +691,11 @@ export default function LightShowScreen() {
             <TouchableOpacity
               style={[
                 s.didTestButton,
-                (!isConnected || hasMovingLock || !isSafetyUnlocked || isTestingDid || isExecutingVehicle) && s.disabledButton,
+                (!isConnected || hasMovingLock || !isSafetyUnlocked || isTestingDid || isScanningDids || isExecutingVehicle) &&
+                  s.disabledButton,
               ]}
               onPress={handleTestManualDid}
-              disabled={!isConnected || hasMovingLock || !isSafetyUnlocked || isTestingDid || isExecutingVehicle}
+              disabled={!isConnected || hasMovingLock || !isSafetyUnlocked || isTestingDid || isScanningDids || isExecutingVehicle}
             >
               {isTestingDid ? (
                 <ActivityIndicator color="#fff" />
@@ -691,5 +801,22 @@ const s = StyleSheet.create({
   },
   didTestButton: { backgroundColor: '#B45309', padding: 14, borderRadius: 10, alignItems: 'center' },
   didTestButtonText: { color: '#fff', fontSize: 10, fontWeight: '900', letterSpacing: 1 },
+  scanButton: { backgroundColor: '#1D4ED8', padding: 14, borderRadius: 10, alignItems: 'center', marginBottom: 14 },
+  scanButtonText: { color: '#fff', fontSize: 10, fontWeight: '900', letterSpacing: 0.8 },
+  scanResultBox: {
+    backgroundColor: '#050507',
+    borderWidth: 1,
+    borderColor: '#1E3A8A',
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 14,
+  },
+  scanResultHeader: { color: '#60A5FA', fontSize: 9, fontWeight: '900', letterSpacing: 0.8, marginBottom: 4 },
+  scanResultMeta: { color: '#E2E8F0', fontSize: 10, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace', marginBottom: 3 },
+  scanResultEmpty: { color: '#FCA5A5', fontSize: 10, marginTop: 6 },
+  didChipWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 8 },
+  didChip: { backgroundColor: '#3B2508', borderColor: '#B45309', borderWidth: 1, borderRadius: 6, paddingHorizontal: 8, paddingVertical: 5 },
+  didChipAccepted: { backgroundColor: '#064E3B', borderColor: '#10B981' },
+  didChipText: { color: '#fff', fontSize: 10, fontWeight: '800', fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace' },
   disclaimer: { color: '#786D70', fontSize: 10, lineHeight: 17, textAlign: 'center', marginTop: 20 },
 });
