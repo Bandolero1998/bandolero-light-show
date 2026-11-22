@@ -163,12 +163,45 @@ export type DiscoveredDid = {
 
 export type Module09ScanResult = {
   targetLabel: string;
+  protocol: 'TP2.0 (KWP2000)' | 'UDS (ISO-TP)';
   partNumber: string | null;
   systemName: string | null;
   sessionResponse: string;
   discoveredDids: DiscoveredDid[];
   scannedCount: number;
 };
+
+export type Tp20Channel = {
+  ecuRxHex: string; // CAN ID we send to (ATSH)
+  ecuTxHex: string; // CAN ID we listen to (ATCRA)
+  rawClean: string;
+};
+
+/**
+ * Parses a VW TP 2.0 Channel Setup positive response on CAN ID 0x209:
+ * Format: 00 D0 <rx_lo> <rx_hi> <tx_lo> <tx_hi> 01
+ * where rx = tester RX (ECU TX, ATCRA) and tx = ECU RX (tester TX, ATSH).
+ */
+export function parseTp20SetupResponse(rawResponse: string): Tp20Channel | null {
+  const clean = Elm327Protocol.cleanResponse(rawResponse);
+  const idx = clean.indexOf('00D0');
+  if (idx === -1 || clean.length < idx + 12) return null;
+  const rxLo = parseInt(clean.slice(idx + 4, idx + 6), 16);
+  const rxHi = parseInt(clean.slice(idx + 6, idx + 8), 16);
+  const txLo = parseInt(clean.slice(idx + 8, idx + 10), 16);
+  const txHi = parseInt(clean.slice(idx + 10, idx + 12), 16);
+  if ([rxLo, rxHi, txLo, txHi].some(isNaN)) return null;
+
+  const ecuTxId = ((rxHi & 0x07) << 8) | rxLo;
+  const ecuRxId = ((txHi & 0x07) << 8) | txLo;
+  if (ecuTxId === 0 || ecuRxId === 0) return null;
+
+  return {
+    ecuRxHex: ecuRxId.toString(16).toUpperCase().padStart(3, '0'),
+    ecuTxHex: ecuTxId.toString(16).toUpperCase().padStart(3, '0'),
+    rawClean: clean,
+  };
+}
 
 export function decodeUdsAsciiPayload(rawResponse: string, expectedPositivePrefix: string): string | null {
   const clean = Elm327Protocol.reassembleIsoTp(rawResponse);
@@ -375,6 +408,29 @@ export class LightShowController {
   }
 
   /**
+   * Configures ELM327/STN ISO-TP Flow Control for a specific UDS CAN Tx/Rx target
+   * so multi-frame responses (e.g. 22 F1 87 Part Number) complete cleanly without NRC 21.
+   */
+  private async configureUdsTarget(txHex: string, rxHex: string): Promise<void> {
+    await this.exec('ATCAF1', 1500).catch(() => {});
+    await this.exec(`ATSH ${txHex}`, 2000);
+    await this.exec(`ATCRA ${rxHex}`, 2000);
+    await this.exec(`ATFCSH ${txHex}`, 1500).catch(() => {});
+    await this.exec('ATFCSD 300000', 1500).catch(() => {});
+    await this.exec('ATFCSM 1', 1500).catch(() => {});
+  }
+
+  /**
+   * Restores ELM327/STN adapter to standard OBD-II functional broadcast mode.
+   */
+  private async restoreObdDefaults(): Promise<void> {
+    await this.exec('ATCAF1', 1500).catch(() => {});
+    await this.exec('ATFCSM 0', 1500).catch(() => {});
+    await this.exec('ATSH 7DF', 2000).catch(() => {});
+    await this.exec('ATCRA', 2000).catch(() => {});
+  }
+
+  /**
    * Emergency Stop / Failsafe:
    * Stops TesterPresent loop, sends ECU release commands to Module 09,
    * returns to Default Session (10 01), and restores standard OBD-II header (ATSH 7DF).
@@ -389,12 +445,10 @@ export class LightShowController {
       try {
         await this.waitUntilIdle(1500);
         if (this.udsSessionActive) {
-          await this.exec('2F000000', 1500).catch(() => {});
           await this.exec('10 01', 1500).catch(() => {});
           this.udsSessionActive = false;
         }
-        await this.exec('ATSH 7DF', 1500).catch(() => {});
-        await this.exec('ATCRA', 1500).catch(() => {});
+        await this.restoreObdDefaults();
         this.log('INFO', 'Kontrola svetala vraćena računaru vozila (10 01 / ATSH 7DF).');
       } catch (err: any) {
         this.log('ERROR', `Greška pri bezbednosnom resetovanju: ${err?.message}`);
@@ -788,7 +842,55 @@ export class LightShowController {
         throw new Error(`VOZILO U POKRETU (${speed} km/h) — skeniranje je blokirano dok vozilo ne stane.`);
       }
 
-      // 2. Identify active Module 09 target & read Part Number (22 F1 87) + System Name (22 F1 97)
+      // 2A. First probe VW TP 2.0 (KWP2000 over CAN) on Module 09 (0x200 -> 0x209)
+      // Many 2010 Audi A8 D4 (4H) BCM1 modules (4H0 907 063) use VW TP 2.0 rather than ISO-TP UDS 0x70E!
+      onProgress?.('Provera VW TP 2.0 protokola na Modulu 09 (0x200 → 0x209)...', 10);
+      await this.exec('ATCAF0', 1500).catch(() => {});
+      await this.exec('ATSH 200', 2000).catch(() => {});
+      await this.exec('ATCRA 209', 2000).catch(() => {});
+      const tp20SetupRaw = await this.exec('09 C0 00 10 00 03 01', 2500).catch(() => '');
+      const tp20Chan = parseTp20SetupResponse(tp20SetupRaw);
+
+      if (tp20Chan) {
+        this.log(
+          'INFO',
+          `✅ MODUL 09 KORISTI VW TP 2.0 (KWP2000)! Kanal otvoren: TX=0x${tp20Chan.ecuRxHex}, RX=0x${tp20Chan.ecuTxHex}`
+        );
+        onProgress?.(`TP 2.0 kanal otvoren (0x${tp20Chan.ecuRxHex} / 0x${tp20Chan.ecuTxHex})...`, 40);
+
+        await this.exec(`ATSH ${tp20Chan.ecuRxHex}`, 2000).catch(() => {});
+        await this.exec(`ATCRA ${tp20Chan.ecuTxHex}`, 2000).catch(() => {});
+        const paramResp = await this.exec('A0 0F 8A FF 32 FF', 2500).catch(() => '');
+        const cleanParam = Elm327Protocol.cleanResponse(paramResp);
+        this.log('INFO', `TP 2.0 parametri (A0 → A1): ${cleanParam || 'NO DATA'}`);
+
+        // Open KWP2000 Extended Session (10 89) and read ECU Part Number (1A 9B)
+        const kwpSess = await this.exec('10 00 02 10 89', 2500).catch(() => '');
+        const cleanKwpSess = Elm327Protocol.cleanResponse(kwpSess);
+        await this.exec('B1', 1200).catch(() => {});
+        const kwpIdRaw = await this.exec('11 00 02 1A 9B', 2500).catch(() => '');
+        const kwpPart = decodeUdsAsciiPayload(kwpIdRaw, '5A9B') || decodeUdsAsciiPayload(kwpIdRaw, '344830');
+
+        // Close TP 2.0 channel cleanly (A8) and restore ELM327 defaults
+        await this.exec('A8', 1500).catch(() => {});
+        await this.restoreObdDefaults();
+
+        onProgress?.('TP 2.0 detekcija završena.', 100);
+        return {
+          targetLabel: `Modul 09 BCM1 TP2.0 (TX 0x${tp20Chan.ecuRxHex} / RX 0x${tp20Chan.ecuTxHex})`,
+          protocol: 'TP2.0 (KWP2000)',
+          partNumber: kwpPart || `TP2.0 OK (${tp20Chan.rawClean})`,
+          systemName: 'BCM1 (VW TP 2.0 / KWP2000)',
+          sessionResponse: cleanKwpSess || cleanParam || 'D0 OK',
+          discoveredDids: [],
+          scannedCount: 0,
+        };
+      }
+
+      // Restore ATCAF1 before UDS ISO-TP scan
+      await this.exec('ATCAF1', 1500).catch(() => {});
+
+      // 2B. Identify active UDS Module target WITH proper ISO-TP Flow Control (ATFCSH/ATFCSM 1)
       let activeTarget = LightShowController.MODULE09_TARGETS[0];
       let partNumber: string | null = null;
       let systemName: string | null = null;
@@ -796,9 +898,8 @@ export class LightShowController {
 
       for (const target of LightShowController.MODULE09_TARGETS) {
         if (this.abortRequested) break;
-        onProgress?.(`Identifikacija ${target.label} (22 F1 87)...`, 12);
-        await this.exec(`ATSH ${target.tx}`, 2000);
-        await this.exec(`ATCRA ${target.rx}`, 2000);
+        onProgress?.(`Identifikacija ${target.label} (22 F1 87)...`, 15);
+        await this.configureUdsTarget(target.tx, target.rx);
 
         const pnRaw = await this.exec('22 F1 87', 3000).catch(() => '');
         const pn = decodeUdsAsciiPayload(pnRaw, '62F187');
@@ -815,7 +916,7 @@ export class LightShowController {
           this.udsSessionActive = true;
           this.log(
             'INFO',
-            `Pronađen modul na ${target.label}: Part#=${pn || 'nepoznat'}, Name=${sn || 'nepoznat'}, Session=${sessionResponse}`
+            `Pronađen UDS modul na ${target.label}: Part#=${pn || 'nepoznat'}, Name=${sn || 'nepoznat'}, Session=${sessionResponse}`
           );
           break;
         }
@@ -887,8 +988,7 @@ export class LightShowController {
       onProgress?.('Zatvaranje sesije (10 01 / ATSH 7DF)...', 96);
       await this.exec('10 01', 2000).catch(() => {});
       this.udsSessionActive = false;
-      await this.exec('ATSH 7DF', 2000).catch(() => {});
-      await this.exec('ATCRA', 2000).catch(() => {});
+      await this.restoreObdDefaults();
 
       onProgress?.('Skeniranje završeno.', 100);
       this.log(
@@ -898,6 +998,7 @@ export class LightShowController {
 
       return {
         targetLabel: activeTarget.label,
+        protocol: 'UDS (ISO-TP)',
         partNumber,
         systemName,
         sessionResponse,

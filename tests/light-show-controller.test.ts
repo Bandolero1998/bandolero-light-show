@@ -4,6 +4,7 @@ import {
   AVAILABLE_EFFECTS,
   LightShowController,
   decodeUdsAsciiPayload,
+  parseTp20SetupResponse,
   parseUds2fResponse,
 } from '../src/services/light-show-controller';
 import type { ObdBleClient } from '../src/services/obd-ble';
@@ -170,4 +171,12 @@ test('LightShowController.scanModule09Dids reads Part Number and discovers valid
   assert.strictEqual(res.discoveredDids[0].status, '6F');
   assert.strictEqual(res.discoveredDids[1].did, '5401');
   assert.strictEqual(res.discoveredDids[1].nrc, '33');
+});
+
+test('parseTp20SetupResponse decodes VW TP 2.0 channel setup response (0x209 -> 0x740/0x300)', () => {
+  // 00 D0 00 03 40 07 01 -> ECU TX = 0x300, ECU RX = 0x740
+  const ch = parseTp20SetupResponse('00 D0 00 03 40 07 01>');
+  assert.ok(ch !== null);
+  assert.strictEqual(ch!.ecuTxHex, '300');
+  assert.strictEqual(ch!.ecuRxHex, '740');
 });
